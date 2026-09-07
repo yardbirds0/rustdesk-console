@@ -21,6 +21,8 @@ export class PermissionController {
         name: permission.name,
         description: permission.description,
         scope: permission.scope,
+        assignable: permission.assignable,
+        system_only: permission.system_only,
         ...(permission.requires ? { requires: permission.requires } : {}),
       })),
     };

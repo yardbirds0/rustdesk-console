@@ -253,14 +253,6 @@ export class StrategyService {
     const success: string[] = [];
     const errors: { target_guid: string; reason: string }[] = [];
 
-    if (targetType !== 'device' && targetType !== 'device_group') {
-      await this.rbacAuthorizationService.assertStrategyTargets(
-        actorGuid,
-        targetType,
-        targets,
-      );
-    }
-
     switch (targetType) {
       case 'device': {
         await this.dataSource.transaction(async (manager) => {

@@ -285,6 +285,10 @@ export class AddressBookRuleService {
       throw new BadRequestException('至少需要一个规则 GUID');
     }
     const uniqueGuids = [...new Set(ruleGuids)];
+    const invalidGuid = uniqueGuids.find((guid) => !isUUID(guid, '4'));
+    if (invalidGuid) {
+      throw new BadRequestException(`规则 GUID 格式无效: ${invalidGuid}`);
+    }
 
     await this.dataSource.transaction(async (manager) => {
       const ruleRepository = manager.getRepository(AddressBookRule);

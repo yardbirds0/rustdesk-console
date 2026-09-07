@@ -351,6 +351,32 @@ describe('Strategy candidate and target contracts', () => {
     expect(transactionManager.update).not.toHaveBeenCalled();
   });
 
+  it('reports missing users through the established partial batch response', async () => {
+    strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
+    userRepository.find.mockResolvedValue([
+      { guid: 'user-1', strategyGuid: null },
+    ]);
+    userRepository.update.mockResolvedValue({ affected: 1 });
+
+    await expect(
+      service.assignStrategy(
+        'strategy-1',
+        'user',
+        ['user-1', 'missing-user'],
+        'actor',
+      ),
+    ).resolves.toEqual({
+      success: ['user-1'],
+      errors: [{ target_guid: 'missing-user', reason: '用户不存在' }],
+    });
+    expect(authorizationService.assertStrategyTargets).toHaveBeenCalledWith(
+      'actor',
+      'user',
+      ['user-1'],
+      transactionManager,
+    );
+  });
+
   it('fails closed when a user unassignment updates fewer rows than read', async () => {
     strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
     userRepository.find.mockResolvedValue([

@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { Server } from 'node:http';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   INestApplication,
@@ -827,6 +828,11 @@ describe('User group integration', () => {
       null,
       ShareRule.READ,
     );
+
+    await expect(
+      ruleService.deleteRules(['not-a-uuid'], owner.guid),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(await ruleRepository.findOneBy({ guid: first.guid })).not.toBeNull();
 
     await expect(
       ruleService.deleteRules([first.guid, randomUUID()], owner.guid),
