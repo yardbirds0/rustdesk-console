@@ -106,18 +106,25 @@ describe('AdminUserService role names', () => {
     expect(result.data[1].role_names).toEqual([]);
   });
 
-  it('omits role names and role queries for a delegated caller', async () => {
+  it('returns role names to a delegated caller authorized to view users', async () => {
     authorizationService.getCurrentUser.mockResolvedValue({ isAdmin: false });
     queryBuilder.getManyAndCount.mockResolvedValue([
       [{ guid: 'user-1', username: 'alice' }] as User[],
       1,
     ]);
+    assignmentRepository.find.mockResolvedValue([
+      { userGuid: 'user-1', roleGuid: 'role-delegated' },
+    ] as UserRoleAssignment[]);
+    roleRepository.find.mockResolvedValue([
+      { guid: 'role-delegated', name: 'Delegated Role' },
+    ] as Role[]);
 
     const result = await service.getAdminUsers(query, 'delegated-actor');
 
-    expect(result.data[0]).not.toHaveProperty('role_names');
-    expect(assignmentRepository.find).not.toHaveBeenCalled();
-    expect(roleRepository.find).not.toHaveBeenCalled();
+    expect(result.data[0].role_names).toEqual(['Delegated Role']);
+    expect(result.data[0]).toHaveProperty('is_protected', false);
+    expect(assignmentRepository.find).toHaveBeenCalledTimes(1);
+    expect(roleRepository.find).toHaveBeenCalledTimes(1);
   });
 
   it('returns an empty page without assignment or role queries', async () => {

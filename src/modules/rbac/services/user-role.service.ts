@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -20,6 +21,8 @@ import {
   filterEffectivePermissionCodes,
   isDeviceGroupScopedPermission,
   isKnownPermissionCode,
+  PERMISSION_CATALOG,
+  PermissionCode,
 } from '../constants/permission-catalog';
 import { RbacAuditService } from './rbac-audit.service';
 import { RbacAuthorizationService } from './rbac-authorization.service';
@@ -44,12 +47,151 @@ export class UserRoleService {
     private readonly authorizationService: RbacAuthorizationService,
   ) {}
 
-  async getUserRoles(userGuid: string) {
-    await this.ensureUserExists(userGuid);
-    const assignments = await this.loadAssignments(userGuid);
+  async getUserRoles(
+    userGuid: string,
+    manager?: import('typeorm').EntityManager,
+  ) {
+    await this.ensureUserExists(manager, userGuid);
+    const assignments = await this.loadAssignments(userGuid, manager);
     return {
       data: assignments.map((assignment) => this.toResponse(assignment)),
       effective_scope: this.effectiveScopes(assignments),
+    };
+  }
+
+  /** Return every role with target-specific, stable delegation decisions. */
+  async getRoleEligibility(userGuid: string, actorGuid: string) {
+    const target = await this.userRepository.findOne({
+      where: { guid: userGuid },
+      select: ['guid', 'isAdmin'],
+    });
+    if (!target) throw new NotFoundException('用户不存在');
+    const actor = await this.authorizationService.getCurrentUser(actorGuid);
+    const roles = await this.roleRepository.find({ order: { name: 'ASC' } });
+    const assignments = await this.loadAssignments(userGuid);
+    const assigned = new Set(
+      assignments.map((assignment) => assignment.roleGuid),
+    );
+    const owner = actor.isAdmin === true;
+    const actorScopes = new Map<
+      PermissionCode,
+      { global: boolean; groups: Set<string> }
+    >();
+    if (!owner) {
+      const grants =
+        await this.authorizationService.getEffectivePermissions(actorGuid);
+      for (const permission of PERMISSION_CATALOG) {
+        const scope = grants.scopes[permission.code];
+        if (scope)
+          actorScopes.set(permission.code, {
+            global: scope.scope_type === 'global',
+            groups: new Set(scope.device_group_guids),
+          });
+      }
+    }
+    const roleRows = await this.rolePermissionRepository.find({
+      where: roles.length
+        ? { roleGuid: In(roles.map((role) => role.guid)) }
+        : [],
+    });
+    const permissionMap = this.groupPermissions(roleRows);
+    const allGroups = await this.deviceGroupRepository.find({
+      select: ['guid', 'name'],
+      order: { name: 'ASC' },
+    });
+    const selfTarget = userGuid === actorGuid;
+    const protectedTarget = await this.authorizationService.isProtectedUser(
+      userGuid,
+      target.isAdmin,
+    );
+    return {
+      data: roles.map((role) => {
+        const permissions = permissionMap.get(role.guid) || [];
+        const locked =
+          role.protectedAccount === true ||
+          permissions.includes('roles.assign');
+        let reason_code: string | null = null;
+        if (!owner && selfTarget) reason_code = 'self_target';
+        else if (!owner && protectedTarget) reason_code = 'protected_target';
+        else if (!owner && locked)
+          reason_code = role.protectedAccount
+            ? 'protected_role'
+            : 'role_grants_roles_assign';
+        else if (!owner) {
+          for (const permission of permissions) {
+            const callerScope = actorScopes.get(permission);
+            if (!callerScope) {
+              reason_code = 'missing_permission';
+              break;
+            }
+            if (callerScope.global) continue;
+            const definition = PERMISSION_CATALOG.find(
+              (item) => item.code === permission,
+            );
+            if (definition?.scope !== 'device_group') {
+              reason_code = 'scope_exceeds_caller';
+              break;
+            }
+          }
+        }
+        const globalAllowed =
+          owner ||
+          (permissions.length > 0 &&
+            permissions.every(
+              (permission) => actorScopes.get(permission)?.global === true,
+            ));
+        const allowedGroupGuids = new Set(allGroups.map((group) => group.guid));
+        const allPermissionsDeviceScoped =
+          permissions.length > 0 &&
+          permissions.every(
+            (permission) =>
+              PERMISSION_CATALOG.find((item) => item.code === permission)
+                ?.scope === 'device_group',
+          );
+        if (allPermissionsDeviceScoped && !owner) {
+          for (const permission of permissions) {
+            const callerScope = actorScopes.get(permission);
+            if (!callerScope) continue;
+            if (!callerScope.global) {
+              for (const guid of [...allowedGroupGuids]) {
+                if (!callerScope.groups.has(guid))
+                  allowedGroupGuids.delete(guid);
+              }
+            }
+          }
+        } else if (!allPermissionsDeviceScoped) {
+          allowedGroupGuids.clear();
+        }
+        const scopeExceeds =
+          !globalAllowed &&
+          !(allPermissionsDeviceScoped && allowedGroupGuids.size > 0);
+        if (!reason_code && scopeExceeds) reason_code = 'scope_exceeds_caller';
+        const canAssign = reason_code === null;
+        const canRemove = assigned.has(role.guid) && canAssign;
+        const allowedScopeTypes: Array<'global' | 'device_group'> = [];
+        if (canAssign) {
+          if (globalAllowed) allowedScopeTypes.push('global');
+          if (allPermissionsDeviceScoped && allowedGroupGuids.size > 0) {
+            allowedScopeTypes.push('device_group');
+          }
+        }
+        return {
+          guid: role.guid,
+          name: role.name,
+          protected_account: role.protectedAccount === true,
+          assigned: assigned.has(role.guid),
+          can_assign: canAssign,
+          can_remove: canRemove,
+          reason_code,
+          allowed_scope_types: allowedScopeTypes,
+          assignable_device_groups:
+            canAssign && allPermissionsDeviceScoped
+              ? allGroups
+                  .filter((group) => allowedGroupGuids.has(group.guid))
+                  .map((group) => ({ guid: group.guid, name: group.name }))
+              : [],
+        };
+      }),
     };
   }
 
@@ -58,9 +200,10 @@ export class UserRoleService {
     dto: ReplaceUserRolesDto,
     actorGuid: string,
   ) {
-    await this.authorizationService.requireSuperAdmin(actorGuid);
-    await this.ensureUserExists(userGuid);
     const normalized = this.validateAssignments(dto.assignments);
+    const requestedRoleGuids = new Set(
+      normalized.map((assignment) => assignment.role_guid),
+    );
     const roleGuids = normalized.map((assignment) => assignment.role_guid);
     const roles = roleGuids.length
       ? await this.roleRepository.find({ where: { guid: In(roleGuids) } })
@@ -91,6 +234,92 @@ export class UserRoleService {
         );
       }
     }
+    const actor = await this.authorizationService.getCurrentUser(actorGuid);
+    const owner = actor.isAdmin === true;
+    if (!owner)
+      await this.authorizationService.requirePermission(
+        actorGuid,
+        'roles.assign',
+      );
+    await this.ensureUserExists(undefined, userGuid);
+    const target = await this.userRepository.findOne({
+      where: { guid: userGuid },
+      select: ['guid', 'isAdmin'],
+    });
+    if (!target && !owner) throw new NotFoundException('用户不存在');
+    if (
+      !owner &&
+      (userGuid === actorGuid ||
+        (await this.authorizationService.isProtectedUser(
+          userGuid,
+          target?.isAdmin,
+        )))
+    ) {
+      throw new ForbiddenException(
+        userGuid === actorGuid
+          ? '不能修改自己的角色'
+          : '受保护账号只能由超级管理员修改',
+      );
+    }
+    if (!owner) {
+      const current = await this.loadAssignments(userGuid);
+      const eligibility = await this.getRoleEligibility(userGuid, actorGuid);
+      const lockedCurrent = eligibility.data.filter(
+        (row) => row.assigned && !row.can_remove,
+      );
+      const omitted = lockedCurrent.find(
+        (row) => !requestedRoleGuids.has(row.guid),
+      );
+      if (omitted)
+        throw new ForbiddenException(`不可移除受保护角色: ${omitted.guid}`);
+      const denied = normalized.find((assignment) => {
+        const row = eligibility.data.find(
+          (candidate) => candidate.guid === assignment.role_guid,
+        );
+        return (
+          !row?.can_assign &&
+          !current.some(
+            (existing) => existing.roleGuid === assignment.role_guid,
+          )
+        );
+      });
+      if (denied)
+        throw new ForbiddenException(`角色不可分配: ${denied.role_guid}`);
+      const caller =
+        await this.authorizationService.getEffectivePermissions(actorGuid);
+      const proposed = new Map<
+        PermissionCode,
+        { global: boolean; groups: Set<string> }
+      >();
+      for (const assignment of normalized) {
+        const perms = permissionsByRole.get(assignment.role_guid) || [];
+        for (const permission of perms) {
+          const entry = proposed.get(permission) || {
+            global: false,
+            groups: new Set<string>(),
+          };
+          if (assignment.scope_type === 'global') entry.global = true;
+          else
+            for (const group of assignment.device_group_guids || [])
+              entry.groups.add(group);
+          proposed.set(permission, entry);
+        }
+      }
+      for (const [permission, grant] of proposed) {
+        const allowed = caller.scopes[permission];
+        if (
+          !allowed ||
+          (grant.global && allowed.scope_type !== 'global') ||
+          (!grant.global &&
+            allowed.scope_type === 'device_group' &&
+            ![...grant.groups].every((group) =>
+              allowed.device_group_guids.includes(group),
+            ))
+        ) {
+          throw new ForbiddenException(`角色权限超出操作者范围: ${permission}`);
+        }
+      }
+    }
     const groupGuids = [
       ...new Set(
         normalized.flatMap((assignment) => assignment.device_group_guids || []),
@@ -103,17 +332,188 @@ export class UserRoleService {
       });
       if (groups.length !== groupGuids.length) {
         const found = new Set(groups.map((group) => group.guid));
-        throw new NotFoundException(
+        throw new BadRequestException(
           `设备组不存在: ${groupGuids.filter((guid) => !found.has(guid)).join(', ')}`,
         );
       }
     }
-    const before = await this.getUserRoles(userGuid);
     await this.dataSource.transaction(async (manager) => {
+      const currentActor = await this.authorizationService.getCurrentUser(
+        actorGuid,
+        manager,
+      );
+      const currentOwner = currentActor.isAdmin === true;
+      if (!currentOwner) {
+        await this.authorizationService.requirePermission(
+          actorGuid,
+          'roles.assign',
+          manager,
+        );
+      }
+      const currentTarget = await manager
+        .getRepository(User)
+        .findOne({ where: { guid: userGuid }, select: ['guid', 'isAdmin'] });
+      if (!currentTarget) throw new NotFoundException('用户不存在');
+      if (
+        !currentOwner &&
+        (await this.authorizationService.isProtectedUser(
+          userGuid,
+          currentTarget.isAdmin,
+          manager,
+        ))
+      ) {
+        throw new ForbiddenException('受保护账号只能由超级管理员修改');
+      }
+      if (!currentOwner && userGuid === actorGuid) {
+        throw new ForbiddenException('不能修改自己的角色');
+      }
+      const currentRolesForWrite = roleGuids.length
+        ? await manager
+            .getRepository(Role)
+            .find({ where: { guid: In(roleGuids) } })
+        : [];
+      if (currentRolesForWrite.length !== roleGuids.length) {
+        const found = new Set(currentRolesForWrite.map((role) => role.guid));
+        throw new NotFoundException(
+          `角色不存在: ${roleGuids.filter((roleGuid) => !found.has(roleGuid)).join(', ')}`,
+        );
+      }
+      if (!currentOwner) {
+        const assignedProtectedRole = currentRolesForWrite.find(
+          (role) => role.protectedAccount === true,
+        );
+        if (assignedProtectedRole) {
+          throw new ForbiddenException(
+            `受保护角色只能由超级管理员分配: ${assignedProtectedRole.guid}`,
+          );
+        }
+      }
+      const currentPermissionRowsForWrite = roleGuids.length
+        ? await manager
+            .getRepository(RolePermission)
+            .find({ where: { roleGuid: In(roleGuids) } })
+        : [];
+      const permissionsForWrite = this.groupPermissions(
+        currentPermissionRowsForWrite,
+      );
+      if (
+        !currentOwner &&
+        [...permissionsForWrite.values()].some((permissions) =>
+          permissions.includes('roles.assign'),
+        )
+      ) {
+        throw new ForbiddenException(
+          '包含 roles.assign 的角色只能由超级管理员分配',
+        );
+      }
+      for (const assignment of normalized) {
+        const permissions = permissionsForWrite.get(assignment.role_guid) || [];
+        if (
+          assignment.scope_type === 'device_group' &&
+          (permissions.length === 0 ||
+            permissions.some(
+              (permission) => !isDeviceGroupScopedPermission(permission),
+            ))
+        ) {
+          throw new BadRequestException(
+            'device_group scope only supports device actions and strategies.assign',
+          );
+        }
+      }
+      if (groupGuids.length) {
+        const currentGroups = await manager
+          .getRepository(DeviceGroup)
+          .find({ where: { guid: In(groupGuids) }, select: ['guid'] });
+        if (currentGroups.length !== groupGuids.length) {
+          const found = new Set(currentGroups.map((group) => group.guid));
+          throw new BadRequestException(
+            `设备组不存在: ${groupGuids.filter((groupGuid) => !found.has(groupGuid)).join(', ')}`,
+          );
+        }
+      }
+      const before = await this.getUserRoles(userGuid, manager);
       const current = await manager.getRepository(UserRoleAssignment).find({
         where: { userGuid },
-        select: ['guid'],
+        select: ['guid', 'roleGuid', 'scopeType'],
       });
+      if (!currentOwner) {
+        const currentRoleGuids = new Set(
+          current.map((assignment) => assignment.roleGuid),
+        );
+        const currentRoles = currentRoleGuids.size
+          ? await manager
+              .getRepository(Role)
+              .find({ where: { guid: In([...currentRoleGuids]) } })
+          : [];
+        const currentPermissionRows = currentRoleGuids.size
+          ? await manager
+              .getRepository(RolePermission)
+              .find({ where: { roleGuid: In([...currentRoleGuids]) } })
+          : [];
+        const currentPermissions = this.groupPermissions(currentPermissionRows);
+        const lockedRoleGuids = new Set(
+          currentRoles
+            .filter((role) => role.protectedAccount)
+            .map((role) => role.guid),
+        );
+        for (const [roleGuid, permissions] of currentPermissions) {
+          if (permissions.includes('roles.assign'))
+            lockedRoleGuids.add(roleGuid);
+        }
+        const omitted = current.find(
+          (assignment) =>
+            !requestedRoleGuids.has(assignment.roleGuid) &&
+            lockedRoleGuids.has(assignment.roleGuid),
+        );
+        if (omitted)
+          throw new ForbiddenException(
+            `不可移除受保护角色: ${omitted.roleGuid}`,
+          );
+        const finalRoleRows = roleGuids.length
+          ? await manager
+              .getRepository(RolePermission)
+              .find({ where: { roleGuid: In(roleGuids) } })
+          : [];
+        const finalPermissions = this.groupPermissions(finalRoleRows);
+        const caller = await this.authorizationService.getEffectivePermissions(
+          actorGuid,
+          manager,
+        );
+        const proposed = new Map<
+          PermissionCode,
+          { global: boolean; groups: Set<string> }
+        >();
+        for (const assignment of normalized) {
+          for (const permission of finalPermissions.get(assignment.role_guid) ||
+            []) {
+            const grant = proposed.get(permission) || {
+              global: false,
+              groups: new Set<string>(),
+            };
+            if (assignment.scope_type === 'global') grant.global = true;
+            else
+              for (const group of assignment.device_group_guids || [])
+                grant.groups.add(group);
+            proposed.set(permission, grant);
+          }
+        }
+        for (const [permission, grant] of proposed) {
+          const allowed = caller.scopes[permission];
+          if (
+            !allowed ||
+            (grant.global && allowed.scope_type !== 'global') ||
+            (!grant.global &&
+              allowed.scope_type === 'device_group' &&
+              ![...grant.groups].every((group) =>
+                allowed.device_group_guids.includes(group),
+              ))
+          ) {
+            throw new ForbiddenException(
+              `角色权限超出操作者范围: ${permission}`,
+            );
+          }
+        }
+      }
       if (current.length) {
         await manager.delete(UserRoleAssignmentDeviceGroup, {
           assignmentGuid: In(current.map((assignment) => assignment.guid)),
@@ -152,8 +552,13 @@ export class UserRoleService {
     return this.getUserRoles(userGuid);
   }
 
-  private async loadAssignments(userGuid: string) {
-    const assignments = await this.assignmentRepository.find({
+  private async loadAssignments(
+    userGuid: string,
+    manager?: import('typeorm').EntityManager,
+  ) {
+    const assignmentRepository =
+      manager?.getRepository(UserRoleAssignment) ?? this.assignmentRepository;
+    const assignments = await assignmentRepository.find({
       where: { userGuid },
       order: { createdAt: 'ASC' },
     });
@@ -163,11 +568,18 @@ export class UserRoleService {
     ];
     const assignmentGuids = assignments.map((assignment) => assignment.guid);
     const [roles, permissions, groups] = await Promise.all([
-      this.roleRepository.find({ where: { guid: In(roleGuids) } }),
-      this.rolePermissionRepository.find({
+      (manager?.getRepository(Role) ?? this.roleRepository).find({
+        where: { guid: In(roleGuids) },
+      }),
+      (
+        manager?.getRepository(RolePermission) ?? this.rolePermissionRepository
+      ).find({
         where: { roleGuid: In(roleGuids) },
       }),
-      this.assignmentGroupRepository.find({
+      (
+        manager?.getRepository(UserRoleAssignmentDeviceGroup) ??
+        this.assignmentGroupRepository
+      ).find({
         where: { assignmentGuid: In(assignmentGuids) },
       }),
     ]);
@@ -294,8 +706,15 @@ export class UserRoleService {
     );
   }
 
-  private async ensureUserExists(userGuid: string) {
-    if (!(await this.userRepository.exist({ where: { guid: userGuid } }))) {
+  private async ensureUserExists(
+    manager: import('typeorm').EntityManager | undefined,
+    userGuid: string,
+  ) {
+    if (
+      !(await (manager?.getRepository(User) ?? this.userRepository).exist({
+        where: { guid: userGuid },
+      }))
+    ) {
       throw new NotFoundException('用户不存在');
     }
   }

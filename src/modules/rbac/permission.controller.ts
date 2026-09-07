@@ -1,7 +1,7 @@
 import { Controller, Get } from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { PERMISSION_CATALOG } from './constants/permission-catalog';
-import { RequireSuperAdmin } from './decorators/require-permission.decorator';
+import { RequirePermission } from './decorators/require-permission.decorator';
 import { RbacAuthorizationService } from './services/rbac-authorization.service';
 
 @Controller('permissions')
@@ -11,7 +11,7 @@ export class PermissionController {
   ) {}
 
   @Get()
-  @RequireSuperAdmin()
+  @RequirePermission('roles.view')
   getPermissions() {
     return {
       data: PERMISSION_CATALOG.map((permission) => ({

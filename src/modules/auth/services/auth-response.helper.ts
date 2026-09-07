@@ -17,6 +17,7 @@ export class AuthResponseHelper {
    */
   buildUserPayload(user: User): UserPayload {
     return {
+      guid: user.guid,
       name: user.username,
       display_name: user.displayName || undefined,
       email: user.email || undefined,

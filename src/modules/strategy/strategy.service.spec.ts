@@ -1,5 +1,9 @@
 import 'reflect-metadata';
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { Repository } from 'typeorm';
@@ -49,8 +53,9 @@ describe('Strategy candidate and target contracts', () => {
     assertStrategyTargets: jest.Mock;
     getCurrentUser: jest.Mock;
     requirePermission: jest.Mock;
+    getEffectiveProtectionMap: jest.Mock;
   };
-  let transactionManager: { update: jest.Mock };
+  let transactionManager: { update: jest.Mock; getRepository: jest.Mock };
   let service: StrategyService;
 
   beforeEach(() => {
@@ -60,6 +65,15 @@ describe('Strategy candidate and target contracts', () => {
     deviceGroupRepository = repository();
     transactionManager = {
       update: jest.fn().mockResolvedValue({ affected: 1 }),
+      getRepository: jest.fn((entity: unknown) =>
+        entity === Peer
+          ? peerRepository
+          : entity === User
+            ? userRepository
+            : entity === DeviceGroup
+              ? deviceGroupRepository
+              : strategyRepository,
+      ),
     };
     peerRepository.manager.transaction.mockImplementation(
       (callback: (manager: typeof transactionManager) => unknown) =>
@@ -75,12 +89,14 @@ describe('Strategy candidate and target contracts', () => {
         global: true,
         deviceGroupGuids: new Set<string>(),
       }),
+      getEffectiveProtectionMap: jest.fn().mockResolvedValue(new Map()),
     };
     service = new StrategyService(
       strategyRepository as unknown as Repository<Strategy>,
       peerRepository as unknown as Repository<Peer>,
       userRepository as unknown as Repository<User>,
       deviceGroupRepository as unknown as Repository<DeviceGroup>,
+      peerRepository.manager as unknown as import('typeorm').DataSource,
       authorizationService as unknown as RbacAuthorizationService,
     );
   });
@@ -279,7 +295,7 @@ describe('Strategy candidate and target contracts', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(strategyRepository.findOne).not.toHaveBeenCalled();
     expect(peerRepository.find).not.toHaveBeenCalled();
-    expect(peerRepository.manager.transaction).not.toHaveBeenCalled();
+    expect(peerRepository.manager.transaction).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a missing strategy as a 404 after target authorization', async () => {
@@ -293,7 +309,7 @@ describe('Strategy candidate and target contracts', () => {
         'actor',
       ),
     ).rejects.toBeInstanceOf(NotFoundException);
-    expect(peerRepository.manager.transaction).not.toHaveBeenCalled();
+    expect(peerRepository.manager.transaction).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a scoped assignment if the device leaves its authorized group before the write', async () => {
@@ -313,6 +329,102 @@ describe('Strategy candidate and target contracts', () => {
       service.assignStrategy('strategy-1', 'device', ['device-1'], 'actor'),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(authorizationService.assertStrategyTargets).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed when a user assignment updates fewer rows than read', async () => {
+    strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
+    userRepository.find.mockResolvedValue([
+      { guid: 'user-1', strategyGuid: null },
+      { guid: 'user-2', strategyGuid: null },
+    ]);
+    userRepository.update.mockResolvedValue({ affected: 1 });
+
+    await expect(
+      service.assignStrategy(
+        'strategy-1',
+        'user',
+        ['user-1', 'user-2'],
+        'actor',
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(userRepository.update).toHaveBeenCalledTimes(1);
+    expect(transactionManager.update).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a user unassignment updates fewer rows than read', async () => {
+    strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
+    userRepository.find.mockResolvedValue([
+      { guid: 'user-1', strategyGuid: 'strategy-1' },
+      { guid: 'user-2', strategyGuid: 'strategy-1' },
+    ]);
+    userRepository.update.mockResolvedValue({ affected: 1 });
+
+    await expect(
+      service.unassignStrategy(
+        'strategy-1',
+        'user',
+        ['user-1', 'user-2'],
+        'actor',
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(userRepository.update).toHaveBeenCalledTimes(1);
+    expect(transactionManager.update).not.toHaveBeenCalled();
+  });
+
+  it('updates only requested authorized groups when assigning', async () => {
+    strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
+    authorizationService.assertStrategyTargets.mockResolvedValue({
+      global: false,
+      deviceGroupGuids: new Set(['group-a', 'group-b']),
+    });
+    deviceGroupRepository.find.mockResolvedValue([
+      { guid: 'group-a', strategyGuid: null },
+    ]);
+
+    await expect(
+      service.assignStrategy(
+        'strategy-1',
+        'device_group',
+        ['group-a'],
+        'actor',
+      ),
+    ).resolves.toEqual({ success: ['group-a'], errors: [] });
+    expect(transactionManager.update).toHaveBeenCalledWith(
+      DeviceGroup,
+      { guid: expect.anything() },
+      { strategyGuid: 'strategy-1' },
+    );
+    const criteria = transactionManager.update.mock.calls[0][1];
+    expect(criteria).not.toHaveProperty('strategyGuid');
+    expect((criteria.guid as { _value: string[] })._value).toEqual(['group-a']);
+  });
+
+  it('updates only requested authorized groups when unassigning', async () => {
+    strategyRepository.findOne.mockResolvedValue({ guid: 'strategy-1' });
+    authorizationService.assertStrategyTargets.mockResolvedValue({
+      global: false,
+      deviceGroupGuids: new Set(['group-a', 'group-b']),
+    });
+    deviceGroupRepository.find.mockResolvedValue([
+      { guid: 'group-a', strategyGuid: 'strategy-1' },
+    ]);
+
+    await expect(
+      service.unassignStrategy(
+        'strategy-1',
+        'device_group',
+        ['group-a'],
+        'actor',
+      ),
+    ).resolves.toEqual({ success: ['group-a'], errors: [] });
+    expect(transactionManager.update).toHaveBeenCalledWith(
+      DeviceGroup,
+      { guid: expect.anything(), strategyGuid: 'strategy-1' },
+      { strategyGuid: null },
+    );
+    const criteria = transactionManager.update.mock.calls[0][1];
+    expect(criteria).not.toHaveProperty('deviceGroupGuids');
+    expect((criteria.guid as { _value: string[] })._value).toEqual(['group-a']);
   });
 
   it('authorizes assignment reads before looking up the strategy', async () => {
@@ -358,7 +470,7 @@ describe('Strategy candidate and target contracts', () => {
       }),
     );
     expect(result).toEqual({
-      data: [{ guid: 'user-1', name: 'Display name' }],
+      data: [{ guid: 'user-1', name: 'Display name', is_protected: false }],
       total: 1,
     });
     expect(JSON.stringify(result)).not.toContain('secret@example.com');

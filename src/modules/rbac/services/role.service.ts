@@ -72,6 +72,18 @@ export class RoleService {
     return this.toResponse(role, await this.loadPermissionCodes(guid));
   }
 
+  async getProtectionImpact(guid: string, actorGuid: string) {
+    await this.authorizationService.requireSuperAdmin(actorGuid);
+    const role = await this.requireRole(guid);
+    return {
+      guid,
+      protected_account: role.protectedAccount === true,
+      affected_member_count: await this.assignmentRepository.count({
+        where: { roleGuid: guid },
+      }),
+    };
+  }
+
   async createRole(dto: CreateRoleDto, actorGuid: string) {
     await this.authorizationService.requireSuperAdmin(actorGuid);
     const name = this.normalizeName(dto.name);
@@ -82,6 +94,7 @@ export class RoleService {
         guid: uuidv4(),
         name,
         note: dto.note?.trim() || null,
+        protectedAccount: dto.protected_account === true,
       });
       try {
         await manager.getRepository(Role).save(role);
@@ -98,7 +111,12 @@ export class RoleService {
           targetGuid: role.guid,
           action: 'role.create',
           result: 'allowed',
-          afterState: { name: role.name, note: role.note, permissions },
+          afterState: {
+            name: role.name,
+            note: role.note,
+            permissions,
+            protected_account: role.protectedAccount,
+          },
         },
         manager,
       );
@@ -107,25 +125,79 @@ export class RoleService {
   }
 
   async updateRole(guid: string, dto: UpdateRoleDto, actorGuid: string) {
-    await this.authorizationService.requireSuperAdmin(actorGuid);
-    const role = await this.requireRole(guid);
-    const beforePermissions = await this.loadPermissionCodes(guid);
-    const beforeName = role.name;
-    const beforeNote = role.note;
-    const name =
-      dto.name === undefined ? role.name : this.normalizeName(dto.name);
-    if (name !== role.name) await this.ensureNameAvailable(name, guid);
-    const permissions =
-      dto.permissions === undefined
-        ? beforePermissions
-        : this.validatePermissions(dto.permissions);
+    // Reject malformed permission edits before opening a transaction. The
+    // same checks are repeated against the transaction snapshot below.
     if (dto.permissions !== undefined) {
-      await this.ensureScopedAssignmentsRemainValid(guid, permissions);
+      const candidate = this.validatePermissions(dto.permissions);
+      await this.ensureScopedAssignmentsRemainValid(guid, candidate);
     }
     return this.dataSource.transaction(async (manager) => {
+      await this.authorizationService.requireSuperAdmin(actorGuid, manager);
+      const roleRepository = manager.getRepository(Role);
+      const permissionRepository = manager.getRepository(RolePermission);
+      const assignmentRepository = manager.getRepository(UserRoleAssignment);
+      const role = await roleRepository.findOne({
+        where: { guid },
+      });
+      if (!role) throw new NotFoundException('角色不存在');
+      const beforePermissions = (
+        await permissionRepository.find({
+          where: { roleGuid: guid },
+        })
+      )
+        .map((row) => row.permissionCode)
+        .filter(isKnownPermissionCode)
+        .sort();
+      const beforeName = role.name;
+      const beforeNote = role.note;
+      const beforeProtected = role.protectedAccount === true;
+      const name =
+        dto.name === undefined ? role.name : this.normalizeName(dto.name);
+      if (name !== role.name) {
+        const existing = await roleRepository
+          .createQueryBuilder('role')
+          .where('LOWER(role.name) = LOWER(:name)', { name })
+          .getOne();
+        if (existing && existing.guid !== guid) {
+          throw new ConflictException('角色名称已存在');
+        }
+      }
+      const permissions =
+        dto.permissions === undefined
+          ? beforePermissions
+          : this.validatePermissions(dto.permissions);
+      if (dto.permissions !== undefined) {
+        await this.ensureScopedAssignmentsRemainValid(
+          guid,
+          permissions,
+          manager,
+        );
+      }
+      const nextProtected =
+        dto.protected_account === undefined
+          ? beforeProtected
+          : dto.protected_account;
+      if (
+        dto.protected_account !== undefined &&
+        nextProtected !== beforeProtected
+      ) {
+        const affectedCount = await assignmentRepository.count({
+          where: { roleGuid: guid },
+        });
+        if (
+          !nextProtected &&
+          affectedCount > 0 &&
+          dto.confirm_protected_account_change !== true
+        ) {
+          throw new BadRequestException(
+            `取消角色保护将影响 ${affectedCount} 个账号，请确认后重试`,
+          );
+        }
+        role.protectedAccount = nextProtected;
+      }
       role.name = name;
       if (dto.note !== undefined) role.note = dto.note.trim() || null;
-      await manager.getRepository(Role).save(role);
+      await roleRepository.save(role);
       if (dto.permissions !== undefined) {
         await this.replacePermissionsWithManager(manager, guid, permissions);
       }
@@ -140,8 +212,21 @@ export class RoleService {
             name: beforeName,
             note: beforeNote,
             permissions: beforePermissions,
+            protected_account: beforeProtected,
           },
-          afterState: { name: role.name, note: role.note, permissions },
+          afterState: {
+            name: role.name,
+            note: role.note,
+            permissions,
+            protected_account: role.protectedAccount,
+            ...(dto.protected_account !== undefined && !role.protectedAccount
+              ? {
+                  affected_member_count: await assignmentRepository.count({
+                    where: { roleGuid: guid },
+                  }),
+                }
+              : {}),
+          },
         },
         manager,
       );
@@ -193,6 +278,7 @@ export class RoleService {
         permissions: permissionRows
           .map((permission) => permission.permissionCode)
           .sort(),
+        protected_account: role.protectedAccount === true,
         assignments: assignments
           .map((assignment) => ({
             guid: assignment.guid,
@@ -282,6 +368,7 @@ export class RoleService {
   private async ensureScopedAssignmentsRemainValid(
     roleGuid: string,
     permissions: PermissionCode[],
+    manager?: import('typeorm').EntityManager,
   ): Promise<void> {
     if (
       permissions.length > 0 &&
@@ -291,7 +378,9 @@ export class RoleService {
     ) {
       return;
     }
-    const hasScopedAssignment = await this.assignmentRepository.exist({
+    const hasScopedAssignment = await (
+      manager?.getRepository(UserRoleAssignment) ?? this.assignmentRepository
+    ).exist({
       where: { roleGuid, scopeType: 'device_group' },
     });
     if (hasScopedAssignment) {
@@ -339,6 +428,7 @@ export class RoleService {
       permissions,
       created_at: role.createdAt,
       updated_at: role.updatedAt,
+      protected_account: role.protectedAccount === true,
     };
   }
 

@@ -156,7 +156,7 @@ export class UserController {
       dto.user_guids,
       'users.status',
     );
-    return this.userService.batchUpdateStatus(dto);
+    return this.userService.batchUpdateStatus(dto, actorGuid);
   }
 
   @Patch('users/batch/security')
@@ -171,7 +171,7 @@ export class UserController {
       dto.user_guids,
       'users.security',
     );
-    return this.userService.batchUpdateSecurity(dto);
+    return this.userService.batchUpdateSecurity(dto, actorGuid);
   }
 
   @Delete('users/batch/sessions')
@@ -186,13 +186,20 @@ export class UserController {
       dto.user_guids,
       'users.force_logout',
     );
-    return this.userService.forceLogout(dto.user_guids);
+    return this.userService.forceLogout(dto.user_guids, actorGuid);
   }
 
   @Get('users/:guid')
   @RequirePermission('users.view')
   async getUser(@Param('guid') guid: string) {
-    return this.userService.getUser(guid);
+    const user = await this.userService.getUser(guid);
+    return {
+      ...user,
+      is_protected: await this.rbacAuthorizationService.isProtectedUser(
+        guid,
+        user.is_admin,
+      ),
+    };
   }
 
   @Patch('users/:guid')
@@ -235,18 +242,12 @@ export class UserController {
       );
     }
     if (dto.is_admin !== undefined) {
-      authorizedField = true;
-      await this.rbacAuthorizationService.assertUserMutation(
-        actorGuid,
-        guid,
-        'users.edit',
-        { is_admin: dto.is_admin },
-      );
+      throw new BadRequestException('系统所有者身份不可通过用户编辑修改');
     }
     if (!authorizedField) {
       throw new BadRequestException('没有可更新的字段');
     }
-    return this.userService.updateUser(guid, dto);
+    return this.userService.updateUser(guid, dto, actorGuid);
   }
 
   @Delete('users/:guid')
@@ -261,7 +262,7 @@ export class UserController {
       guid,
       'users.delete',
     );
-    await this.userService.deleteUser(guid);
+    await this.userService.deleteUser(guid, actorGuid);
     return { message: '用户已删除' };
   }
 
@@ -278,7 +279,7 @@ export class UserController {
       guid,
       'users.security',
     );
-    await this.userService.updateUserSecurity(guid, dto);
+    await this.userService.updateUserSecurity(guid, dto, actorGuid);
     return { message: '安全设置已更新' };
   }
 
@@ -294,6 +295,6 @@ export class UserController {
       guid,
       'users.force_logout',
     );
-    return this.userService.forceLogout([guid]);
+    return this.userService.forceLogout([guid], actorGuid);
   }
 }

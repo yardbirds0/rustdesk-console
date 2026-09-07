@@ -13,6 +13,7 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { DataSource, Repository } from 'typeorm';
 import request from 'supertest';
+import * as bcrypt from 'bcryptjs';
 import { DatabaseInitService } from '../../database/database-init.service';
 import { AdminGuard } from '../../common/guards/admin.guard';
 import { AddressBookPeerTag } from '../address-book/entities/address-book-peer-tag.entity';
@@ -31,6 +32,7 @@ import { AddressBookRuleService } from '../address-book/services/address-book-ru
 import { DeviceGroupUserPermission } from '../device-group/entities/device-group-user-permission.entity';
 import { UserUserPermission } from '../device-group/entities/user-user-permission.entity';
 import { AuthService } from '../auth/services/auth.service';
+import { LoginSession } from '../auth/entities/login-session.entity';
 import { LdapService } from '../ldap/ldap.service';
 import { OidcService } from '../oidc/services/oidc.service';
 import { Strategy } from '../strategy/entities/strategy.entity';
@@ -77,7 +79,11 @@ describe('User group integration', () => {
   let permissionService: AddressBookPermissionService;
   let ruleService: AddressBookRuleService;
   let userService: UserService;
-  let authorizationService: { assertUsersMutation: jest.Mock };
+  let authorizationService: {
+    assertUsersMutation: jest.Mock;
+    getEffectiveProtectionMap: jest.Mock;
+    isProtectedUser: jest.Mock;
+  };
 
   beforeEach(async () => {
     dataSource = new DataSource({
@@ -90,6 +96,7 @@ describe('User group integration', () => {
         UserGroup,
         User,
         UserToken,
+        LoginSession,
         Strategy,
         AddressBook,
         AddressBookPeer,
@@ -106,6 +113,8 @@ describe('User group integration', () => {
     addressBookRepository = dataSource.getRepository(AddressBook);
     authorizationService = {
       assertUsersMutation: jest.fn().mockResolvedValue(undefined),
+      getEffectiveProtectionMap: jest.fn().mockResolvedValue(new Map()),
+      isProtectedUser: jest.fn().mockResolvedValue(false),
     };
 
     userGroupService = new UserGroupService(
@@ -151,6 +160,8 @@ describe('User group integration', () => {
           Promise.resolve({ enabled: true, rpName: 'RustDesk Console' }),
       } as unknown as GeneralSettingsService,
       dataSource,
+      authorizationService as unknown as RbacAuthorizationService,
+      dataSource.getRepository(LoginSession),
     );
   });
 
@@ -369,11 +380,14 @@ describe('User group integration', () => {
     const bob = await createUser('security-bob', defaultGroup.guid);
 
     await expect(
-      userService.batchUpdateSecurity({
-        user_guids: [alice.guid, alice.guid, bob.guid],
-        tfa_enforce: true,
-        email_verification: true,
-      }),
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [alice.guid, alice.guid, bob.guid],
+          tfa_enforce: true,
+          email_verification: true,
+        },
+        alice.guid,
+      ),
     ).resolves.toEqual({ message: '批量安全设置已更新' });
 
     for (const guid of [alice.guid, bob.guid]) {
@@ -385,15 +399,64 @@ describe('User group integration', () => {
     }
 
     await expect(
-      userService.batchUpdateSecurity({
-        user_guids: [alice.guid, randomUUID()],
-        tfa_enforce: false,
-      }),
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [alice.guid, randomUUID()],
+          tfa_enforce: false,
+        },
+        alice.guid,
+      ),
     ).rejects.toThrow('用户不存在');
     expect(
       (await userRepository.findOneByOrFail({ guid: alice.guid })).getUserInfo()
         .other?.tfa_enforce,
     ).toBe(true);
+  });
+
+  it('changes a password and atomically revokes tokens and pending sessions', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const user = await createUser('password-user', defaultGroup.guid);
+    user.password = await bcrypt.hash('old-password', 10);
+    await userRepository.save(user);
+    await dataSource.getRepository(UserToken).save({
+      guid: randomUUID(),
+      userGuid: user.guid,
+      jti: randomUUID(),
+      expiresAt: new Date(Date.now() + 60_000),
+      isRevoked: false,
+    });
+    await dataSource.getRepository(LoginSession).save({
+      guid: randomUUID(),
+      userGuid: user.guid,
+      method: 'tfa',
+      expiresAt: new Date(Date.now() + 60_000),
+      used: false,
+    });
+
+    await userService.changePassword(user.guid, {
+      current_password: 'old-password',
+      new_password: 'new-password',
+    });
+
+    expect(
+      (
+        await dataSource
+          .getRepository(UserToken)
+          .findOneBy({ userGuid: user.guid })
+      )?.isRevoked,
+    ).toBe(true);
+    expect(
+      await dataSource.getRepository(LoginSession).countBy({
+        userGuid: user.guid,
+        used: false,
+      }),
+    ).toBe(0);
+    const reloaded = await userRepository
+      .createQueryBuilder('user')
+      .where('user.guid = :guid', { guid: user.guid })
+      .addSelect('user.password')
+      .getOneOrFail();
+    expect(await bcrypt.compare('new-password', reloaded.password)).toBe(true);
   });
 
   it('rolls back every user security change when a later update fails', async () => {
@@ -410,10 +473,13 @@ describe('User group integration', () => {
     );
 
     await expect(
-      userService.batchUpdateSecurity({
-        user_guids: [first.guid, second.guid],
-        tfa_enforce: true,
-      }),
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [first.guid, second.guid],
+          tfa_enforce: true,
+        },
+        first.guid,
+      ),
     ).rejects.toThrow('forced security update failure');
 
     for (const guid of [first.guid, second.guid]) {
@@ -444,6 +510,7 @@ describe('User group integration', () => {
       undefined as never,
       undefined as never,
       userGroupService,
+      dataSource,
     );
     const ldapService = new LdapService(
       userRepository,

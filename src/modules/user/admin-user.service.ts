@@ -26,7 +26,7 @@ export class AdminUserService {
     query: AdminUserQueryDto,
     actorGuid: string,
   ): Promise<{ data: any[]; total: number }> {
-    const actor = await this.authorizationService.getCurrentUser(actorGuid);
+    await this.authorizationService.getCurrentUser(actorGuid);
     const {
       current,
       pageSize,
@@ -115,7 +115,10 @@ export class AdminUserService {
     const strategyMap = new Map(strategies.map((s) => [s.guid, s.name]));
 
     const roleNamesByUser = new Map<string, string[]>();
-    if (actor.isAdmin && users.length > 0) {
+    const protectedUsers = new Set(
+      users.filter((user) => user.isAdmin).map((user) => user.guid),
+    );
+    if (users.length > 0) {
       const assignments = await this.assignmentRepository.find({
         where: { userGuid: In(users.map((user) => user.guid)) },
         select: ['userGuid', 'roleGuid'],
@@ -126,7 +129,7 @@ export class AdminUserService {
       const roles = roleGuids.length
         ? await this.roleRepository.find({
             where: { guid: In(roleGuids) },
-            select: ['guid', 'name'],
+            select: ['guid', 'name', 'protectedAccount'],
           })
         : [];
       const roleNameByGuid = new Map(
@@ -134,6 +137,10 @@ export class AdminUserService {
       );
       const roleNameSetsByUser = new Map<string, Set<string>>();
       for (const assignment of assignments) {
+        const role = roles.find(
+          (candidate) => candidate.guid === assignment.roleGuid,
+        );
+        if (role?.protectedAccount) protectedUsers.add(assignment.userGuid);
         const roleName = roleNameByGuid.get(assignment.roleGuid);
         if (!roleName) continue;
         const roleNames =
@@ -155,6 +162,7 @@ export class AdminUserService {
         note: u.note || '',
         status: u.status,
         is_admin: u.isAdmin,
+        is_protected: protectedUsers.has(u.guid),
         third_auth_type: u.thirdAuthType || '',
         strategy_guid: u.strategyGuid || '',
         strategy_name: u.strategyGuid
@@ -165,9 +173,10 @@ export class AdminUserService {
         avatar: u.avatar || '',
         created_at: u.createdAt,
         updated_at: u.updatedAt,
-        ...(actor.isAdmin
-          ? { role_names: roleNamesByUser.get(u.guid) ?? [] }
-          : {}),
+        role_names: [
+          ...(u.isAdmin ? ['Super Admin'] : []),
+          ...(roleNamesByUser.get(u.guid) ?? []),
+        ],
       })),
       total,
     };

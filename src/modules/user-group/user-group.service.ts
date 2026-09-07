@@ -226,14 +226,14 @@ export class UserGroupService {
   }
 
   async deleteGroup(guid: string, actorGuid: string) {
-    const protectedUsers = await this.userRepository.find({
-      where: { userGroupGuid: guid, isAdmin: true },
+    const affectedUsers = await this.userRepository.find({
+      where: { userGroupGuid: guid },
       select: ['guid'],
     });
-    if (protectedUsers.length) {
+    if (affectedUsers.length) {
       await this.authorizationService.assertUsersMutation(
         actorGuid,
-        protectedUsers.map((user) => user.guid),
+        affectedUsers.map((user) => user.guid),
         'user_groups.delete',
       );
     }
@@ -256,6 +256,17 @@ export class UserGroupService {
       if (!defaultGroup) {
         throw new BadRequestException('默认用户组不存在');
       }
+
+      const currentUsers = await userRepository.find({
+        where: { userGroupGuid: guid },
+        select: ['guid'],
+      });
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        currentUsers.map((user) => user.guid),
+        'user_groups.delete',
+        manager,
+      );
 
       const movedUsers = await userRepository.update(
         { userGroupGuid: guid },
@@ -296,6 +307,10 @@ export class UserGroupService {
       .take(pageSize)
       .getManyAndCount();
 
+    const protection =
+      await this.authorizationService.getEffectiveProtectionMap(
+        users.map((user) => user.guid),
+      );
     return {
       data: users.map((user) => ({
         guid: user.guid,
@@ -304,6 +319,7 @@ export class UserGroupService {
         note: user.note || '',
         status: user.status,
         is_admin: user.isAdmin,
+        is_protected: protection.get(user.guid) === true,
         user_group_guid: group.guid,
         user_group_name: group.name,
       })),
@@ -335,6 +351,15 @@ export class UserGroupService {
       if (users.length !== uniqueGuids.length) {
         throw new NotFoundException('一个或多个用户不存在');
       }
+
+      // Re-check immediately before the conditional writes so a role-based
+      // protection change cannot turn this into a partial membership update.
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        users.map((user) => user.guid),
+        'user_groups.membership',
+        manager,
+      );
 
       const guidsToMove = users
         .filter((user) => user.userGroupGuid !== guid)

@@ -330,7 +330,7 @@ export class LdapService {
    */
   private async findOrCreateUser(
     ldapUserInfo: LdapUserInfo,
-    config: LdapConfig,
+    _config: LdapConfig,
   ): Promise<User> {
     // 通过 LDAP subject 查找已关联的用户
     const ldapSubject = `ldap:${ldapUserInfo.username}`;
@@ -339,21 +339,12 @@ export class LdapService {
     });
 
     if (existingUser) {
-      // 更新用户信息（邮箱、管理员角色）
+      // LDAP may authenticate and update profile data, but never controls the
+      // immutable system-owner marker.
       let needsUpdate = false;
 
       if (ldapUserInfo.email && existingUser.email !== ldapUserInfo.email) {
         existingUser.email = ldapUserInfo.email;
-        needsUpdate = true;
-      }
-
-      // 根据组映射更新管理员角色
-      const shouldBeAdmin = this.isAdminByGroups(
-        ldapUserInfo.groups,
-        config.adminGroups,
-      );
-      if (existingUser.isAdmin !== shouldBeAdmin) {
-        existingUser.isAdmin = shouldBeAdmin;
         needsUpdate = true;
       }
 
@@ -395,10 +386,7 @@ export class LdapService {
         user.email = ldapUserInfo.email || null;
         user.password = null as unknown as string;
         user.status = UserStatus.ACTIVE;
-        user.isAdmin = this.isAdminByGroups(
-          ldapUserInfo.groups,
-          config.adminGroups,
-        );
+        user.isAdmin = false;
         user.note = ldapUserInfo.displayName
           ? `LDAP用户 (${ldapUserInfo.displayName})`
           : 'LDAP用户';
@@ -424,34 +412,6 @@ export class LdapService {
     }
 
     throw new Error(`创建 LDAP 用户失败，用户名冲突已重试 ${maxRetries} 次`);
-  }
-
-  /**
-   * 根据组映射判断用户是否为管理员
-   *
-   * @param userGroups 用户所属组 DN 列表
-   * @param adminGroups 管理员组 DN 列表
-   * @returns 是否为管理员
-   */
-  private isAdminByGroups(
-    userGroups: string[],
-    adminGroups: string[],
-  ): boolean {
-    if (!adminGroups || adminGroups.length === 0) {
-      return false;
-    }
-
-    return userGroups.some((userGroup) =>
-      adminGroups.some((adminGroup) => this.dnEquals(userGroup, adminGroup)),
-    );
-  }
-
-  /**
-   * DN 大小写不敏感比较
-   * LDAP DN 是大小写不敏感的
-   */
-  private dnEquals(dn1: string, dn2: string): boolean {
-    return dn1.toLowerCase() === dn2.toLowerCase();
   }
 
   /**
