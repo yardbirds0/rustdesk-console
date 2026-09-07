@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { DataSource, Repository, In } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
@@ -59,6 +59,7 @@ export class UserService {
     private readonly userGroupService: UserGroupService,
     private readonly emailService: EmailService,
     private readonly generalSettingsService: GeneralSettingsService,
+    private readonly dataSource: DataSource,
   ) {}
 
   async getAccessibleUsers(
@@ -392,6 +393,8 @@ export class UserService {
     if (!user) {
       throw new NotFoundException('用户不存在');
     }
+    const previousStatus = user.status;
+    const previousIsAdmin = user.isAdmin;
 
     if (dto.name !== undefined) {
       const existingUser = await this.userRepository.findOne({
@@ -438,6 +441,13 @@ export class UserService {
     }
 
     await this.userRepository.save(user);
+
+    if (
+      (dto.status !== undefined && dto.status !== previousStatus) ||
+      (dto.is_admin !== undefined && dto.is_admin !== previousIsAdmin)
+    ) {
+      await this.revokeActiveTokens([guid]);
+    }
 
     return { message: '用户已更新' };
   }
@@ -560,6 +570,16 @@ export class UserService {
     return { message: '强制登出成功' };
   }
 
+  private async revokeActiveTokens(userGuids: string[]): Promise<void> {
+    const uniqueGuids = [...new Set(userGuids)];
+    if (uniqueGuids.length === 0) return;
+
+    await this.userTokenRepository.update(
+      { userGuid: In(uniqueGuids), isRevoked: false },
+      { isRevoked: true },
+    );
+  }
+
   async batchUpdateStatus(dto: BatchStatusDto) {
     const { user_guids, status } = dto;
     const users = await this.userRepository.find({
@@ -593,6 +613,10 @@ export class UserService {
       succeeded.push(...guidsToUpdate);
     }
 
+    if (status !== UserStatus.ACTIVE && guidsToUpdate.length > 0) {
+      await this.revokeActiveTokens(guidsToUpdate);
+    }
+
     return {
       succeeded,
       failed,
@@ -604,29 +628,36 @@ export class UserService {
 
   async batchUpdateSecurity(dto: BatchSecurityDto) {
     const { user_guids, tfa_enforce, email_verification } = dto;
-    const users = await this.userRepository.find({
-      where: { guid: In(user_guids) },
+    const uniqueGuids = [...new Set(user_guids)];
+
+    await this.dataSource.transaction(async (manager) => {
+      const userRepository = manager.getRepository(User);
+      const users = await userRepository.find({
+        where: { guid: In(uniqueGuids) },
+      });
+
+      if (!users.length || users.length !== uniqueGuids.length) {
+        throw new NotFoundException('用户不存在');
+      }
+
+      const usersByGuid = new Map(users.map((user) => [user.guid, user]));
+      for (const guid of uniqueGuids) {
+        const user = usersByGuid.get(guid)!;
+        const userInfo: UserInfo = user.getUserInfo();
+        userInfo.other = userInfo.other || {};
+
+        if (tfa_enforce !== undefined) {
+          userInfo.other.tfa_enforce = tfa_enforce;
+        }
+
+        if (email_verification !== undefined) {
+          userInfo.email_verification = email_verification;
+        }
+
+        user.setUserInfo(userInfo);
+        await userRepository.save(user);
+      }
     });
-
-    if (users.length === 0) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    for (const user of users) {
-      const userInfo: UserInfo = user.getUserInfo();
-      userInfo.other = userInfo.other || {};
-
-      if (tfa_enforce !== undefined) {
-        userInfo.other.tfa_enforce = tfa_enforce;
-      }
-
-      if (email_verification !== undefined) {
-        userInfo.email_verification = email_verification;
-      }
-
-      user.setUserInfo(userInfo);
-      await this.userRepository.save(user);
-    }
 
     return { message: '批量安全设置已更新' };
   }

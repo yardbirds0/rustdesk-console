@@ -19,13 +19,14 @@ import {
 } from '../dto';
 import { AddressBookPermissionService } from './address-book-permission.service';
 import { UserGroupService } from '../../user-group/user-group.service';
+import { UserGroup } from '../../user-group/entities/user-group.entity';
 
 interface SharedAddressBookRow {
   guid: string;
   name: string | null;
   owner: string;
   note: string | null;
-  info: string | null;
+  info?: string | null;
   rule: string | number;
 }
 
@@ -68,6 +69,9 @@ export class AddressBookRuleService {
     @InjectRepository(User)
     private userRepository: Repository<User>,
 
+    @InjectRepository(UserGroup)
+    private userGroupRepository: Repository<UserGroup>,
+
     private readonly permissionService: AddressBookPermissionService,
     private readonly userGroupService: UserGroupService,
     private readonly dataSource: DataSource,
@@ -102,8 +106,54 @@ export class AddressBookRuleService {
       order: { createdAt: 'ASC' },
     });
 
+    const userIds = [
+      ...new Set(
+        rules
+          .map((rule) => rule.targetUserId)
+          .filter((guid): guid is string => Boolean(guid)),
+      ),
+    ];
+    const groupIds = [
+      ...new Set(
+        rules
+          .map((rule) => rule.targetGroupId)
+          .filter((guid): guid is string => Boolean(guid)),
+      ),
+    ];
+    const usersPromise: Promise<User[]> = userIds.length
+      ? this.userRepository.find({
+          where: { guid: In(userIds) },
+          select: ['guid', 'username', 'displayName'],
+        })
+      : Promise.resolve([]);
+    const groupsPromise: Promise<UserGroup[]> = groupIds.length
+      ? this.userGroupRepository.find({
+          where: { guid: In(groupIds) },
+          select: ['guid', 'name'],
+        })
+      : Promise.resolve([]);
+    const [users, groups] = await Promise.all([usersPromise, groupsPromise]);
+    const userTargets = new Map<string, { name: string; display_name: string }>(
+      users.map((user) => [
+        user.guid,
+        {
+          name: user.username,
+          display_name: user.displayName || user.username,
+        },
+      ]),
+    );
+    const groupTargets = new Map<string, { name: string }>(
+      groups.map((group) => [group.guid, { name: group.name }] as const),
+    );
+
     return {
-      data: rules.map((rule) => this.toResponseFormat(rule)),
+      data: rules.map((rule) => ({
+        ...this.toResponseFormat(rule),
+        target:
+          (rule.targetUserId && userTargets.get(rule.targetUserId)) ||
+          (rule.targetGroupId && groupTargets.get(rule.targetGroupId)) ||
+          undefined,
+      })),
       total,
     };
   }
@@ -234,33 +284,46 @@ export class AddressBookRuleService {
     if (!ruleGuids || ruleGuids.length === 0) {
       throw new BadRequestException('至少需要一个规则 GUID');
     }
+    const uniqueGuids = [...new Set(ruleGuids)];
 
-    // 获取所有规则的信息（用于权限检查和获取 addressBookGuid 字段）
-    const rules = await this.ruleRepository.find({
-      where: ruleGuids.map((g) => ({ guid: g })),
-      relations: ['addressBook'],
-    });
-
-    if (rules.length === 0) {
-      throw new NotFoundException('未找到任何规则');
-    }
-
-    // 检查每个规则所属的地址簿权限，确保用户对所有地址簿都有权限
-    for (const rule of rules) {
-      await this.permissionService.checkAddressBookAccess(
-        rule.addressBookGuid,
-        userId,
-        ShareRule.FULL_CONTROL,
-      );
-    }
-
-    // 由于 AddressBookRule 有多个主键，需要使用完整的主键对象删除
-    for (const rule of rules) {
-      await this.ruleRepository.delete({
-        guid: rule.guid,
-        addressBookGuid: rule.addressBookGuid,
+    await this.dataSource.transaction(async (manager) => {
+      const ruleRepository = manager.getRepository(AddressBookRule);
+      const rules = await ruleRepository.find({
+        where: uniqueGuids.map((guid) => ({ guid })),
+        relations: ['addressBook'],
       });
-    }
+      const rulesByGuid = new Map<string, AddressBookRule[]>();
+      for (const rule of rules) {
+        const matches = rulesByGuid.get(rule.guid) || [];
+        matches.push(rule);
+        rulesByGuid.set(rule.guid, matches);
+      }
+      if (uniqueGuids.some((guid) => !rulesByGuid.has(guid))) {
+        throw new NotFoundException('未找到任何规则');
+      }
+
+      const orderedRules = uniqueGuids.flatMap(
+        (guid) => rulesByGuid.get(guid) || [],
+      );
+      for (const rule of orderedRules) {
+        await this.permissionService.checkAddressBookAccess(
+          rule.addressBookGuid,
+          userId,
+          ShareRule.FULL_CONTROL,
+        );
+      }
+
+      // AddressBookRule has a compound primary key; delete each complete key.
+      for (const rule of orderedRules) {
+        const result = await ruleRepository.delete({
+          guid: rule.guid,
+          addressBookGuid: rule.addressBookGuid,
+        });
+        if (result.affected !== 1) {
+          throw new NotFoundException('未找到任何规则');
+        }
+      }
+    });
 
     return { message: '删除成功' };
   }
@@ -281,6 +344,51 @@ export class AddressBookRuleService {
 
   async getWebSharedAddressBooks(userId: string, query: PaginationDto) {
     return this.getAccessibleAddressBooks(userId, query, true);
+  }
+
+  async getWebSharedAddressBook(guid: string, userId: string) {
+    const result = await this.getAccessibleAddressBooks(
+      userId,
+      { current: 1, pageSize: 1 },
+      true,
+      guid,
+    );
+    const addressBook = result.data[0];
+    if (!addressBook) {
+      throw new NotFoundException('共享地址簿不存在');
+    }
+    return addressBook;
+  }
+
+  async getShareCandidates(guid: string, userId: string) {
+    await this.permissionService.checkAddressBookAccess(
+      guid,
+      userId,
+      ShareRule.FULL_CONTROL,
+    );
+
+    const [users, groups] = await Promise.all([
+      this.userRepository.find({
+        select: ['guid', 'username', 'displayName'],
+        order: { username: 'ASC' },
+      }),
+      this.userGroupRepository.find({
+        select: ['guid', 'name'],
+        order: { name: 'ASC' },
+      }),
+    ]);
+
+    return {
+      users: users.map((user) => ({
+        guid: user.guid,
+        name: user.username,
+        display_name: user.displayName || user.username,
+      })),
+      groups: groups.map((group) => ({
+        guid: group.guid,
+        name: group.name,
+      })),
+    };
   }
 
   async getCustomAddressBooks(userId: string, query: PaginationDto) {
@@ -402,6 +510,7 @@ export class AddressBookRuleService {
     userId: string,
     query: PaginationDto,
     sharedOnly: boolean,
+    guid?: string,
   ) {
     const { current = 1, pageSize = 100, name } = query;
     const skip = (current - 1) * pageSize;
@@ -448,6 +557,10 @@ export class AddressBookRuleService {
       );
     }
 
+    if (guid) {
+      queryBuilder.andWhere('addressBook.guid = :guid', { guid });
+    }
+
     const trimmedName = name?.trim();
     if (trimmedName) {
       queryBuilder.andWhere('addressBook.name LIKE :name', {
@@ -460,12 +573,11 @@ export class AddressBookRuleService {
       .select('COUNT(DISTINCT addressBook.guid)', 'total')
       .getRawOne<{ total: string | number }>();
 
-    const rows = await queryBuilder
+    const rowsQuery = queryBuilder
       .select('addressBook.guid', 'guid')
       .addSelect('addressBook.name', 'name')
       .addSelect('addressBook.owner', 'owner')
       .addSelect('addressBook.note', 'note')
-      .addSelect('addressBook.info', 'info')
       .addSelect(
         'MAX(CASE WHEN addressBook.owner = :userId THEN :fullControl ELSE rule.rule END)',
         'rule',
@@ -474,8 +586,15 @@ export class AddressBookRuleService {
       .groupBy('addressBook.guid')
       .addGroupBy('addressBook.name')
       .addGroupBy('addressBook.owner')
-      .addGroupBy('addressBook.note')
-      .addGroupBy('addressBook.info')
+      .addGroupBy('addressBook.note');
+
+    if (!sharedOnly) {
+      rowsQuery
+        .addSelect('addressBook.info', 'info')
+        .addGroupBy('addressBook.info');
+    }
+
+    const rows = await rowsQuery
       .orderBy('addressBook.name', 'ASC')
       .addOrderBy('addressBook.guid', 'ASC')
       .offset(skip)
@@ -504,7 +623,13 @@ export class AddressBookRuleService {
       owner: userMap.get(row.owner) || row.owner,
       note: row.note || '',
       rule: Number(row.rule),
-      info: row.info ? (JSON.parse(row.info) as Record<string, unknown>) : {},
+      ...(!sharedOnly
+        ? {
+            info: row.info
+              ? (JSON.parse(row.info) as Record<string, unknown>)
+              : {},
+          }
+        : {}),
       ...(sharedOnly ? { is_owner: row.owner === userId } : {}),
     }));
 

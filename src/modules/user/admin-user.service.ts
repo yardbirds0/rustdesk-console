@@ -1,9 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { User } from './entities/user.entity';
 import { Strategy } from '../strategy/entities/strategy.entity';
 import { AdminUserQueryDto } from './dto/admin-user.dto';
+import { UserRoleAssignment } from '../rbac/entities/user-role-assignment.entity';
+import { Role } from '../rbac/entities/role.entity';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 
 @Injectable()
 export class AdminUserService {
@@ -12,11 +15,18 @@ export class AdminUserService {
     private userRepository: Repository<User>,
     @InjectRepository(Strategy)
     private strategyRepository: Repository<Strategy>,
+    @InjectRepository(UserRoleAssignment)
+    private assignmentRepository: Repository<UserRoleAssignment>,
+    @InjectRepository(Role)
+    private roleRepository: Repository<Role>,
+    private readonly authorizationService: RbacAuthorizationService,
   ) {}
 
   async getAdminUsers(
     query: AdminUserQueryDto,
+    actorGuid: string,
   ): Promise<{ data: any[]; total: number }> {
+    const actor = await this.authorizationService.getCurrentUser(actorGuid);
     const {
       current,
       pageSize,
@@ -104,6 +114,38 @@ export class AdminUserService {
         : [];
     const strategyMap = new Map(strategies.map((s) => [s.guid, s.name]));
 
+    const roleNamesByUser = new Map<string, string[]>();
+    if (actor.isAdmin && users.length > 0) {
+      const assignments = await this.assignmentRepository.find({
+        where: { userGuid: In(users.map((user) => user.guid)) },
+        select: ['userGuid', 'roleGuid'],
+      });
+      const roleGuids = [
+        ...new Set(assignments.map((assignment) => assignment.roleGuid)),
+      ];
+      const roles = roleGuids.length
+        ? await this.roleRepository.find({
+            where: { guid: In(roleGuids) },
+            select: ['guid', 'name'],
+          })
+        : [];
+      const roleNameByGuid = new Map(
+        roles.map((role) => [role.guid, role.name]),
+      );
+      const roleNameSetsByUser = new Map<string, Set<string>>();
+      for (const assignment of assignments) {
+        const roleName = roleNameByGuid.get(assignment.roleGuid);
+        if (!roleName) continue;
+        const roleNames =
+          roleNameSetsByUser.get(assignment.userGuid) ?? new Set();
+        roleNames.add(roleName);
+        roleNameSetsByUser.set(assignment.userGuid, roleNames);
+      }
+      for (const [userGuid, roleNames] of roleNameSetsByUser) {
+        roleNamesByUser.set(userGuid, [...roleNames].sort());
+      }
+    }
+
     return {
       data: users.map((u) => ({
         guid: u.guid,
@@ -123,6 +165,9 @@ export class AdminUserService {
         avatar: u.avatar || '',
         created_at: u.createdAt,
         updated_at: u.updatedAt,
+        ...(actor.isAdmin
+          ? { role_names: roleNamesByUser.get(u.guid) ?? [] }
+          : {}),
       })),
       total,
     };

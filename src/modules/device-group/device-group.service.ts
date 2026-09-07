@@ -1,14 +1,16 @@
 import {
+  BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
-  BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { DataSource, Repository, In } from 'typeorm';
 import * as uuid from 'uuid';
 import { DeviceGroup } from './entities/device-group.entity';
 import { User, UserStatus } from '../user/entities/user.entity';
 import { Peer, PeerStatus } from '../../common/entities/peer.entity';
+import { Sysinfo } from '../../common/entities/sysinfo.entity';
 import { Strategy } from '../strategy/entities/strategy.entity';
 import { DeviceGroupUserPermission } from './entities/device-group-user-permission.entity';
 import {
@@ -17,6 +19,9 @@ import {
   DeviceOperationFailure,
 } from './dto/device-status.dto';
 import { UpdateDeviceDto } from './dto/update-device.dto';
+import type { PermissionScope } from '../rbac/services/rbac-authorization.service';
+import { UserRoleAssignmentDeviceGroup } from '../rbac/entities/user-role-assignment-device-group.entity';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 
 @Injectable()
 /**
@@ -40,10 +45,14 @@ export class DeviceGroupService {
     private userRepository: Repository<User>,
     @InjectRepository(Peer)
     private peerRepository: Repository<Peer>,
+    @InjectRepository(Sysinfo)
+    private sysinfoRepository: Repository<Sysinfo>,
     @InjectRepository(DeviceGroupUserPermission)
     private deviceGroupUserPermissionRepository: Repository<DeviceGroupUserPermission>,
     @InjectRepository(Strategy)
     private strategyRepository: Repository<Strategy>,
+    private readonly dataSource: DataSource,
+    private readonly rbacAuthorizationService: RbacAuthorizationService,
   ) {}
 
   /**
@@ -59,6 +68,7 @@ export class DeviceGroupService {
     userGuid: string,
     query: { current: number; pageSize: number; name?: string },
     isAdmin: boolean = false,
+    rbacScope?: PermissionScope,
   ): Promise<{
     data: { guid: string; name: string; note?: string }[];
     total: number;
@@ -67,13 +77,24 @@ export class DeviceGroupService {
     const skip = (current - 1) * pageSize;
 
     // 管理员可以看到所有设备组
-    if (isAdmin) {
+    if (isAdmin || rbacScope) {
       let queryBuilder = this.deviceGroupRepository
         .createQueryBuilder('dg')
         .select(['dg.guid', 'dg.name', 'dg.note'])
         .orderBy('dg.name', 'ASC')
         .skip(skip)
         .take(pageSize);
+
+      if (rbacScope && !rbacScope.global) {
+        if (rbacScope.deviceGroupGuids.size === 0) {
+          queryBuilder = queryBuilder.andWhere('1 = 0');
+        } else {
+          queryBuilder = queryBuilder.andWhere(
+            'dg.guid IN (:...rbacDeviceGroups)',
+            { rbacDeviceGroups: [...rbacScope.deviceGroupGuids] },
+          );
+        }
+      }
 
       if (name) {
         queryBuilder = queryBuilder.andWhere('dg.name LIKE :name', {
@@ -261,9 +282,11 @@ export class DeviceGroupService {
    */
   async createDeviceGroup(
     name: string,
-    note?: string,
-    _allowedIncomings?: unknown[],
+    note: string | undefined,
+    _allowedIncomings: unknown[] | undefined,
+    actorGuid: string,
   ) {
+    await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
     // 检查设备组名称是否已存在
     const existingGroup = await this.deviceGroupRepository.findOne({
       where: { name },
@@ -292,10 +315,12 @@ export class DeviceGroupService {
    */
   async updateDeviceGroup(
     guid: string,
-    name?: string,
-    note?: string,
-    _allowedIncomings?: unknown[],
+    name: string | undefined,
+    note: string | undefined,
+    _allowedIncomings: unknown[] | undefined,
+    actorGuid: string,
   ) {
+    await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
     const deviceGroup = await this.deviceGroupRepository.findOne({
       where: { guid },
     });
@@ -327,15 +352,28 @@ export class DeviceGroupService {
    * 删除设备组
    * @param guid 设备组GUID
    */
-  async deleteDeviceGroup(guid: string) {
-    const deviceGroup = await this.deviceGroupRepository.findOne({
-      where: { guid },
-    });
-    if (!deviceGroup) {
-      throw new NotFoundException('设备组不存在');
-    }
+  async deleteDeviceGroup(guid: string, actorGuid: string) {
+    await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
+    await this.dataSource.transaction(async (manager) => {
+      const deviceGroupRepository = manager.getRepository(DeviceGroup);
+      const deviceGroup = await deviceGroupRepository.findOne({
+        where: { guid },
+      });
+      if (!deviceGroup) {
+        throw new NotFoundException('设备组不存在');
+      }
 
-    await this.deviceGroupRepository.remove(deviceGroup);
+      const scopedAssignments = await manager
+        .getRepository(UserRoleAssignmentDeviceGroup)
+        .count({ where: { deviceGroupGuid: guid } });
+      if (scopedAssignments > 0) {
+        throw new BadRequestException(
+          '设备组仍被角色授权引用，不能删除，请先移除相关授权',
+        );
+      }
+
+      await deviceGroupRepository.remove(deviceGroup);
+    });
   }
 
   /**
@@ -343,7 +381,12 @@ export class DeviceGroupService {
    * @param guid 设备组GUID
    * @param deviceIds 设备ID列表
    */
-  async addDevicesToGroup(guid: string, deviceIds: string[]) {
+  async addDevicesToGroup(
+    guid: string,
+    deviceIds: string[],
+    actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
     const deviceGroup = await this.deviceGroupRepository.findOne({
       where: { guid },
     });
@@ -376,7 +419,12 @@ export class DeviceGroupService {
    * @param guid 设备组GUID
    * @param deviceIds 设备ID列表
    */
-  async removeDevicesFromGroup(guid: string, deviceIds: string[]) {
+  async removeDevicesFromGroup(
+    guid: string,
+    deviceIds: string[],
+    actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
     const deviceGroup = await this.deviceGroupRepository.findOne({
       where: { guid },
     });
@@ -417,25 +465,35 @@ export class DeviceGroupService {
       current: number;
       pageSize: number;
       id?: string;
+      status?: string;
+      is_online?: string;
       device_name?: string;
       user_name?: string;
       device_username?: string;
+      os?: string;
       device_group_name?: string;
+      device_group_guid?: string;
       group_name?: string;
     },
     isAdmin: boolean = false,
+    rbacScope?: PermissionScope,
   ): Promise<{ data: any[]; total: number }> {
     const {
       current,
       pageSize,
       id,
+      status,
+      is_online,
       device_name,
       user_name,
       device_username,
+      os,
       device_group_name,
+      device_group_guid,
       group_name,
     } = query;
     const skip = (current - 1) * pageSize;
+    const onlineAfter = new Date(Date.now() - 60_000);
 
     let queryBuilder = this.peerRepository
       .createQueryBuilder('peer')
@@ -445,14 +503,18 @@ export class DeviceGroupService {
         'peer.uuid',
         'peer.userGuid',
         'peer.deviceGroupGuid',
+        'peer.strategyGuid',
+        'peer.note',
+        'peer.status',
         'peer.ver',
         'peer.modifiedAt',
+        'peer.lastHeartbeat',
         'peer.updatedAt',
         'dg.name',
       ]);
 
     // 管理员可以看到所有设备
-    if (!isAdmin) {
+    if (!isAdmin && !rbacScope) {
       // 普通用户只能看到自己有权限访问的设备
       queryBuilder = queryBuilder.andWhere(
         `(peer.userGuid = :userGuid
@@ -465,6 +527,19 @@ export class DeviceGroupService {
       );
     }
 
+    // RBAC scope is an additional administrative boundary. It is applied
+    // before pagination/count and intentionally excludes ungrouped devices.
+    if (rbacScope && !rbacScope.global) {
+      if (!rbacScope.deviceGroupGuids.size) {
+        queryBuilder = queryBuilder.andWhere('1 = 0');
+      } else {
+        queryBuilder = queryBuilder.andWhere(
+          'peer.deviceGroupGuid IN (:...rbacDeviceGroups)',
+          { rbacDeviceGroups: [...rbacScope.deviceGroupGuids] },
+        );
+      }
+    }
+
     // 按设备ID过滤
     if (id) {
       queryBuilder = queryBuilder.andWhere('peer.id LIKE :id', {
@@ -472,11 +547,33 @@ export class DeviceGroupService {
       });
     }
 
+    if (status !== undefined) {
+      queryBuilder = queryBuilder.andWhere('peer.status = :status', {
+        status: Number(status),
+      });
+    }
+
+    if (is_online === '1') {
+      queryBuilder = queryBuilder.andWhere(
+        'peer.lastHeartbeat > :onlineAfter',
+        { onlineAfter },
+      );
+    } else if (is_online === '0') {
+      queryBuilder = queryBuilder.andWhere(
+        '(peer.lastHeartbeat IS NULL OR peer.lastHeartbeat <= :onlineAfter)',
+        { onlineAfter },
+      );
+    }
+
     // 按设备名称过滤
     if (device_name) {
-      queryBuilder = queryBuilder.andWhere('peer.name LIKE :deviceName', {
-        deviceName: `%${device_name}%`,
-      });
+      queryBuilder = queryBuilder.andWhere(
+        `EXISTS (
+          SELECT 1 FROM sysinfos si
+          WHERE si.uuid = peer.uuid AND si.hostname LIKE :deviceName
+        )`,
+        { deviceName: `%${device_name}%` },
+      );
     }
 
     // 按用户名过滤
@@ -493,7 +590,10 @@ export class DeviceGroupService {
     // 按设备用户名过滤
     if (device_username) {
       queryBuilder = queryBuilder.andWhere(
-        'peer.deviceUsername LIKE :deviceUsername',
+        `EXISTS (
+          SELECT 1 FROM sysinfos si
+          WHERE si.uuid = peer.uuid AND si.username LIKE :deviceUsername
+        )`,
         { deviceUsername: `%${device_username}%` },
       );
     }
@@ -503,6 +603,23 @@ export class DeviceGroupService {
       queryBuilder = queryBuilder.andWhere('dg.name = :deviceGroupName', {
         deviceGroupName: device_group_name,
       });
+    }
+
+    if (device_group_guid) {
+      queryBuilder = queryBuilder.andWhere(
+        'peer.deviceGroupGuid = :deviceGroupGuid',
+        { deviceGroupGuid: device_group_guid },
+      );
+    }
+
+    if (os) {
+      queryBuilder = queryBuilder.andWhere(
+        `EXISTS (
+          SELECT 1 FROM sysinfos si
+          WHERE si.uuid = peer.uuid AND si.os LIKE :os
+        )`,
+        { os: `%${os}%` },
+      );
     }
 
     // 按组名过滤（通过设备组）
@@ -518,18 +635,82 @@ export class DeviceGroupService {
       .take(pageSize)
       .getManyAndCount();
 
-    return {
-      data: peers.map((p) => ({
-        guid: p.uuid,
-        id: p.id,
-        userGuid: p.userGuid,
-        deviceGroupGuid: p.deviceGroupGuid,
-        device_group_name:
-          (p.deviceGroup as { name?: string } | null)?.name || '',
-        last_online: p.updatedAt,
-      })),
-      total,
+    const uuids = peers.map((peer) => peer.uuid);
+    const userGuids = [
+      ...new Set(
+        peers
+          .map((peer) => peer.userGuid)
+          .filter((guid): guid is string => guid !== null),
+      ),
+    ];
+    const strategyGuids = [
+      ...new Set(
+        peers
+          .map((peer) => peer.strategyGuid)
+          .filter((guid): guid is string => guid !== null),
+      ),
+    ];
+    const [sysinfos, users, strategies]: [Sysinfo[], User[], Strategy[]] =
+      await Promise.all([
+        uuids.length
+          ? this.sysinfoRepository.find({ where: { uuid: In(uuids) } })
+          : [],
+        userGuids.length
+          ? this.userRepository.find({ where: { guid: In(userGuids) } })
+          : [],
+        strategyGuids.length
+          ? this.strategyRepository.find({
+              where: { guid: In(strategyGuids) },
+            })
+          : [],
+      ]);
+    const sysinfoByUuid = new Map(sysinfos.map((item) => [item.uuid, item]));
+    const userByGuid = new Map(users.map((item) => [item.guid, item]));
+    const strategyByGuid = new Map(strategies.map((item) => [item.guid, item]));
+    const formatVersion = (version: number): string => {
+      if (!version) return '';
+      const major = Math.floor(version / 1_000_000);
+      const minor = Math.floor((version % 1_000_000) / 1_000);
+      const patch = Math.floor((version % 1_000) / 10);
+      const suffix = version % 10;
+      return `${major}.${minor}.${patch}${suffix ? `-${suffix}` : ''}`;
     };
+
+    const data = peers.map((peer) => {
+      const sysinfo = sysinfoByUuid.get(peer.uuid);
+      return {
+        guid: peer.uuid,
+        id: peer.id,
+        userGuid: peer.userGuid,
+        user: peer.userGuid || '',
+        user_name: peer.userGuid
+          ? userByGuid.get(peer.userGuid)?.username || ''
+          : '',
+        deviceGroupGuid: peer.deviceGroupGuid,
+        device_group_name:
+          (peer.deviceGroup as { name?: string } | null)?.name || '',
+        strategy_name: peer.strategyGuid
+          ? strategyByGuid.get(peer.strategyGuid)?.name || ''
+          : '',
+        note: peer.note || '',
+        status: peer.status,
+        is_online: peer.lastHeartbeat
+          ? peer.lastHeartbeat > onlineAfter
+          : false,
+        last_online: peer.lastHeartbeat?.toISOString() || null,
+        info: {
+          device_name: sysinfo?.hostname || '',
+          username: sysinfo?.username || '',
+          os: sysinfo?.os || '',
+          version: formatVersion(peer.ver),
+          cpu: sysinfo?.cpu || '',
+          memory: sysinfo?.memory || '',
+          ip: '',
+        },
+      };
+    });
+
+    return { data, total };
   }
 
   /**
@@ -542,14 +723,19 @@ export class DeviceGroupService {
    * @param guid 设备GUID
    * @param dto 更新数据
    */
-  async updateDevice(guid: string, dto: UpdateDeviceDto) {
-    const peer = await this.peerRepository.findOne({
-      where: { uuid: guid },
-    });
-    if (!peer) {
-      throw new NotFoundException('设备不存在');
+  async updateDevice(guid: string, dto: UpdateDeviceDto, actorGuid: string) {
+    const { scope } = await this.rbacAuthorizationService.assertDeviceAccess(
+      actorGuid,
+      'devices.edit',
+      guid,
+    );
+    if (
+      dto.userName !== undefined ||
+      dto.deviceGroupName !== undefined ||
+      dto.strategyName !== undefined
+    ) {
+      await this.rbacAuthorizationService.requireSuperAdmin(actorGuid);
     }
-
     const updateData: Partial<Peer> = {};
 
     if (dto.userName !== undefined) {
@@ -599,7 +785,23 @@ export class DeviceGroupService {
     }
 
     if (Object.keys(updateData).length > 0) {
-      await this.peerRepository.update({ uuid: guid }, updateData);
+      const result = await this.peerRepository.update(
+        scope.global
+          ? { uuid: guid }
+          : {
+              uuid: guid,
+              deviceGroupGuid: In([...scope.deviceGroupGuids]),
+            },
+        updateData,
+      );
+      if (result.affected !== 1) {
+        await this.rbacAuthorizationService.assertDeviceAccess(
+          actorGuid,
+          'devices.edit',
+          guid,
+        );
+        throw new ConflictException('设备信息已发生变化，请重试');
+      }
     }
   }
 
@@ -614,15 +816,17 @@ export class DeviceGroupService {
   async updateDeviceStatus(
     guids: string[],
     status: DeviceStatus,
+    actorGuid: string,
   ): Promise<DeviceOperationResult> {
+    const { peers: existingPeers, scope } =
+      await this.rbacAuthorizationService.assertDevicesAccess(
+        actorGuid,
+        'devices.status',
+        guids,
+      );
     const uniqueGuids = [...new Set(guids)];
     const succeeded: string[] = [];
     const failed: DeviceOperationFailure[] = [];
-
-    const existingPeers = await this.peerRepository.find({
-      where: { uuid: In(uniqueGuids) },
-      select: ['uuid'],
-    });
 
     const existingUuids = new Set(existingPeers.map((p) => p.uuid));
 
@@ -640,12 +844,35 @@ export class DeviceGroupService {
           ? PeerStatus.ACTIVE
           : PeerStatus.DISABLED;
 
-      await this.peerRepository
-        .createQueryBuilder()
-        .update(Peer)
-        .set({ status: statusValue })
-        .where('uuid IN (:...uuids)', { uuids: guidsToUpdate })
-        .execute();
+      const concurrentChange = new ConflictException(
+        '设备信息已发生变化，请重试',
+      );
+      try {
+        await this.dataSource.transaction(async (manager) => {
+          const result = await manager.update(
+            Peer,
+            scope.global
+              ? { uuid: In(guidsToUpdate) }
+              : {
+                  uuid: In(guidsToUpdate),
+                  deviceGroupGuid: In([...scope.deviceGroupGuids]),
+                },
+            { status: statusValue },
+          );
+          if (result.affected !== guidsToUpdate.length) {
+            throw concurrentChange;
+          }
+        });
+      } catch (error) {
+        if (error === concurrentChange) {
+          await this.rbacAuthorizationService.assertDevicesAccess(
+            actorGuid,
+            'devices.status',
+            guidsToUpdate,
+          );
+        }
+        throw error;
+      }
 
       succeeded.push(...guidsToUpdate);
     }
@@ -663,14 +890,27 @@ export class DeviceGroupService {
    * 删除设备
    * @param guid 设备GUID
    */
-  async deleteDevice(guid: string) {
-    const peer = await this.peerRepository.findOne({
-      where: { uuid: guid },
-    });
-    if (!peer) {
-      throw new NotFoundException('设备不存在');
+  async deleteDevice(guid: string, actorGuid: string) {
+    const { scope } = await this.rbacAuthorizationService.assertDeviceAccess(
+      actorGuid,
+      'devices.delete',
+      guid,
+    );
+    const result = await this.peerRepository.delete(
+      scope.global
+        ? { uuid: guid }
+        : {
+            uuid: guid,
+            deviceGroupGuid: In([...scope.deviceGroupGuids]),
+          },
+    );
+    if (result.affected !== 1) {
+      await this.rbacAuthorizationService.assertDeviceAccess(
+        actorGuid,
+        'devices.delete',
+        guid,
+      );
+      throw new ConflictException('设备信息已发生变化，请重试');
     }
-
-    await this.peerRepository.remove(peer);
   }
 }

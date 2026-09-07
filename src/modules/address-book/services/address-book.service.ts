@@ -309,6 +309,10 @@ export class AddressBookService {
     return this.ruleService.getWebSharedAddressBooks(userId, query);
   }
 
+  async getWebSharedAddressBook(guid: string, userId: string) {
+    return this.ruleService.getWebSharedAddressBook(guid, userId);
+  }
+
   /**
    * 添加共享地址簿
    * 委托给 RuleService 处理

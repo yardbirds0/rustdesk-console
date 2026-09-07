@@ -19,6 +19,7 @@ import {
 import { Sysinfo, Peer } from '../../common/entities';
 import { User } from '../user/entities/user.entity';
 import { UserGroupModule } from '../user-group/user-group.module';
+import { UserGroup } from '../user-group/entities/user-group.entity';
 
 /**
  * 地址簿模块
@@ -49,6 +50,7 @@ import { UserGroupModule } from '../user-group/user-group.module';
       Sysinfo,
       Peer,
       User,
+      UserGroup,
     ]),
     UserGroupModule,
   ],
