@@ -1,5 +1,9 @@
 import 'reflect-metadata';
-import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { DataSource, Repository } from 'typeorm';
 import { Peer } from '../../common/entities/peer.entity';
@@ -59,6 +63,7 @@ describe('RbacAuthorizationService', () => {
   let assignmentGroupRepository: MockRepository;
   let peerRepository: MockRepository;
   let deviceGroupRepository: MockRepository;
+  let roleRepository: MockRepository;
   let auditService: { recordDenied: jest.Mock };
   let service: RbacAuthorizationService;
 
@@ -75,11 +80,13 @@ describe('RbacAuthorizationService', () => {
     assignmentGroupRepository = repository();
     peerRepository = repository();
     deviceGroupRepository = repository();
+    roleRepository = repository();
     auditService = { recordDenied: jest.fn().mockResolvedValue(undefined) };
     userRepository.findOne.mockResolvedValue(activeUser);
     assignmentRepository.find.mockResolvedValue([]);
     rolePermissionRepository.find.mockResolvedValue([]);
     assignmentGroupRepository.find.mockResolvedValue([]);
+    roleRepository.find.mockResolvedValue([]);
     peerRepository.find.mockResolvedValue([]);
     service = new RbacAuthorizationService(
       userRepository as unknown as Repository<User>,
@@ -89,6 +96,7 @@ describe('RbacAuthorizationService', () => {
       peerRepository as unknown as Repository<Peer>,
       deviceGroupRepository as unknown as Repository<DeviceGroup>,
       auditService as unknown as RbacAuditService,
+      roleRepository as unknown as Repository<Role>,
     );
   });
 
@@ -102,6 +110,43 @@ describe('RbacAuthorizationService', () => {
       service.requirePermission('actor', 'devices.view'),
     ).rejects.toBeInstanceOf(UnauthorizedException);
     expect(assignmentRepository.find).not.toHaveBeenCalled();
+  });
+
+  it('uses the transaction manager for target protection rechecks', async () => {
+    const managerUserRepository = repository();
+    const managerAssignmentRepository = repository();
+    const managerRoleRepository = repository();
+    const manager = {
+      getRepository: jest.fn((entity: unknown) =>
+        entity === User
+          ? managerUserRepository
+          : entity === UserRoleAssignment
+            ? managerAssignmentRepository
+            : managerRoleRepository,
+      ),
+    };
+    managerUserRepository.findOne
+      .mockResolvedValueOnce({
+        guid: 'actor',
+        status: UserStatus.ACTIVE,
+        isAdmin: false,
+      })
+      .mockResolvedValueOnce({ guid: 'target', isAdmin: false });
+    managerAssignmentRepository.find.mockResolvedValue([]);
+    rolePermissionRepository.find.mockResolvedValue([
+      { roleGuid: 'actor-role', permissionCode: 'users.edit' },
+    ]);
+    await expect(
+      service.assertUserMutation(
+        'actor',
+        'target',
+        'users.edit',
+        undefined,
+        manager as never,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(managerUserRepository.findOne).toHaveBeenCalled();
+    expect(userRepository.findOne).not.toHaveBeenCalled();
   });
 
   it('applies a device-group grant and never treats it as global', async () => {
@@ -437,12 +482,299 @@ describe('UserRoleService', () => {
     });
   });
 
+  it('returns the agreed role eligibility scope contract', async () => {
+    const userRepository = repository();
+    const roleRepository = repository();
+    const rolePermissionRepository = repository();
+    const assignmentRepository = repository();
+    const deviceGroupRepository = repository();
+    userRepository.findOne.mockResolvedValue({
+      guid: 'target',
+      isAdmin: false,
+    });
+    roleRepository.find.mockResolvedValue([
+      { guid: 'device-role', name: 'Device role', protectedAccount: false },
+      { guid: 'global-role', name: 'Global role', protectedAccount: false },
+      { guid: 'mixed-role', name: 'Mixed role', protectedAccount: false },
+    ]);
+    assignmentRepository.find.mockResolvedValue([]);
+    rolePermissionRepository.find.mockResolvedValue([
+      { roleGuid: 'device-role', permissionCode: 'devices.view' },
+      { roleGuid: 'global-role', permissionCode: 'users.view' },
+      { roleGuid: 'mixed-role', permissionCode: 'devices.view' },
+      { roleGuid: 'mixed-role', permissionCode: 'users.view' },
+    ]);
+    deviceGroupRepository.find.mockResolvedValue([
+      { guid: 'group-1', name: 'Group 1' },
+      { guid: 'group-2', name: 'Group 2' },
+    ]);
+    const eligibilityService = new UserRoleService(
+      userRepository as unknown as Repository<User>,
+      roleRepository as unknown as Repository<Role>,
+      rolePermissionRepository as unknown as Repository<RolePermission>,
+      assignmentRepository as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      deviceGroupRepository as unknown as Repository<DeviceGroup>,
+      {} as DataSource,
+      {} as RbacAuditService,
+      {
+        getCurrentUser: jest.fn().mockResolvedValue({ isAdmin: true }),
+        getEffectivePermissions: jest.fn(),
+        isProtectedUser: jest.fn().mockResolvedValue(false),
+      } as unknown as RbacAuthorizationService,
+    );
+    const result = await eligibilityService.getRoleEligibility(
+      'target',
+      'owner',
+    );
+    expect(result.data.map((role) => role.allowed_scope_types)).toEqual([
+      ['global', 'device_group'],
+      ['global'],
+      ['global'],
+    ]);
+    expect(result.data[0].assignable_device_groups).toEqual([
+      { guid: 'group-1', name: 'Group 1' },
+      { guid: 'group-2', name: 'Group 2' },
+    ]);
+  });
+
+  it('computes delegated scope types and group intersections from effective grants', async () => {
+    const userRepository = repository();
+    const roleRepository = repository();
+    const rolePermissionRepository = repository();
+    const assignmentRepository = repository();
+    const deviceGroupRepository = repository();
+    userRepository.findOne.mockResolvedValue({
+      guid: 'target',
+      isAdmin: false,
+    });
+    roleRepository.find.mockResolvedValue([
+      { guid: 'group-role', name: 'Group role', protectedAccount: false },
+      {
+        guid: 'global-device-role',
+        name: 'Device role',
+        protectedAccount: false,
+      },
+      { guid: 'mixed-role', name: 'Mixed role', protectedAccount: false },
+      { guid: 'empty-role', name: 'Empty role', protectedAccount: false },
+      {
+        guid: 'no-overlap-role',
+        name: 'No overlap role',
+        protectedAccount: false,
+      },
+    ] as Role[]);
+    assignmentRepository.find.mockResolvedValue([]);
+    rolePermissionRepository.find.mockResolvedValue([
+      { roleGuid: 'group-role', permissionCode: 'devices.view' },
+      { roleGuid: 'global-device-role', permissionCode: 'devices.view' },
+      { roleGuid: 'mixed-role', permissionCode: 'devices.view' },
+      { roleGuid: 'mixed-role', permissionCode: 'users.view' },
+      { roleGuid: 'no-overlap-role', permissionCode: 'devices.view' },
+      { roleGuid: 'no-overlap-role', permissionCode: 'strategies.assign' },
+    ]);
+    deviceGroupRepository.find.mockResolvedValue([
+      { guid: 'group-1', name: 'Group 1' },
+      { guid: 'group-2', name: 'Group 2' },
+    ]);
+    const authorizationService = {
+      getCurrentUser: jest.fn().mockResolvedValue({ isAdmin: false }),
+      getEffectivePermissions: jest.fn().mockResolvedValue({
+        permissions: ['devices.view', 'users.view'],
+        scopes: {
+          'devices.view': {
+            scope_type: 'device_group',
+            device_group_guids: ['group-1'],
+          },
+          'users.view': {
+            scope_type: 'global',
+            device_group_guids: [],
+          },
+          'strategies.assign': {
+            scope_type: 'device_group',
+            device_group_guids: ['group-2'],
+          },
+        },
+      }),
+      isProtectedUser: jest.fn().mockResolvedValue(false),
+    };
+    const eligibilityService = new UserRoleService(
+      userRepository as unknown as Repository<User>,
+      roleRepository as unknown as Repository<Role>,
+      rolePermissionRepository as unknown as Repository<RolePermission>,
+      assignmentRepository as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      deviceGroupRepository as unknown as Repository<DeviceGroup>,
+      {} as DataSource,
+      {} as RbacAuditService,
+      authorizationService as unknown as RbacAuthorizationService,
+    );
+
+    const result = await eligibilityService.getRoleEligibility(
+      'target',
+      'delegated-actor',
+    );
+
+    expect(
+      Object.fromEntries(
+        result.data.map((role) => [
+          role.name,
+          {
+            can_assign: role.can_assign,
+            reason_code: role.reason_code,
+            allowed_scope_types: role.allowed_scope_types,
+            assignable_device_groups: role.assignable_device_groups,
+          },
+        ]),
+      ),
+    ).toEqual({
+      'Device role': {
+        can_assign: true,
+        reason_code: null,
+        allowed_scope_types: ['device_group'],
+        assignable_device_groups: [{ guid: 'group-1', name: 'Group 1' }],
+      },
+      'Empty role': {
+        can_assign: false,
+        reason_code: 'scope_exceeds_caller',
+        allowed_scope_types: [],
+        assignable_device_groups: [],
+      },
+      'Group role': {
+        can_assign: true,
+        reason_code: null,
+        allowed_scope_types: ['device_group'],
+        assignable_device_groups: [{ guid: 'group-1', name: 'Group 1' }],
+      },
+      'Mixed role': {
+        can_assign: false,
+        reason_code: 'scope_exceeds_caller',
+        allowed_scope_types: [],
+        assignable_device_groups: [],
+      },
+      'No overlap role': {
+        can_assign: false,
+        reason_code: 'scope_exceeds_caller',
+        allowed_scope_types: [],
+        assignable_device_groups: [],
+      },
+    });
+
+    authorizationService.getEffectivePermissions.mockResolvedValue({
+      permissions: ['devices.view', 'users.view'],
+      scopes: {
+        'devices.view': { scope_type: 'global', device_group_guids: [] },
+        'users.view': { scope_type: 'global', device_group_guids: [] },
+      },
+    });
+    const globallyCovered = await eligibilityService.getRoleEligibility(
+      'target',
+      'delegated-actor',
+    );
+    const deviceRole = globallyCovered.data.find(
+      (role) => role.name === 'Device role',
+    );
+    expect(deviceRole).toMatchObject({
+      allowed_scope_types: ['global', 'device_group'],
+      assignable_device_groups: [
+        { guid: 'group-1', name: 'Group 1' },
+        { guid: 'group-2', name: 'Group 2' },
+      ],
+    });
+  });
+
+  it('reports stable self, protected-target, and locked-role reasons', async () => {
+    const userRepository = repository();
+    const roleRepository = repository();
+    const rolePermissionRepository = repository();
+    const assignmentRepository = repository();
+    const deviceGroupRepository = repository();
+    userRepository.findOne.mockResolvedValue({
+      guid: 'target',
+      isAdmin: false,
+    });
+    roleRepository.find.mockResolvedValue([
+      {
+        guid: 'protected-role',
+        name: 'Protected role',
+        protectedAccount: true,
+      },
+      { guid: 'assign-role', name: 'Assign role', protectedAccount: false },
+    ] as Role[]);
+    rolePermissionRepository.find.mockResolvedValue([
+      { roleGuid: 'protected-role', permissionCode: 'users.view' },
+      { roleGuid: 'assign-role', permissionCode: 'roles.assign' },
+      { roleGuid: 'assign-role', permissionCode: 'roles.view' },
+      { roleGuid: 'assign-role', permissionCode: 'users.view' },
+    ]);
+    assignmentRepository.find.mockResolvedValue([]);
+    deviceGroupRepository.find.mockResolvedValue([]);
+    const authorizationService = {
+      getCurrentUser: jest.fn().mockResolvedValue({ isAdmin: false }),
+      getEffectivePermissions: jest.fn().mockResolvedValue({
+        permissions: ['users.view', 'roles.assign'],
+        scopes: {
+          'users.view': { scope_type: 'global', device_group_guids: [] },
+          'roles.assign': { scope_type: 'global', device_group_guids: [] },
+        },
+      }),
+      isProtectedUser: jest.fn().mockResolvedValue(true),
+    };
+    const eligibilityService = new UserRoleService(
+      userRepository as unknown as Repository<User>,
+      roleRepository as unknown as Repository<Role>,
+      rolePermissionRepository as unknown as Repository<RolePermission>,
+      assignmentRepository as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      deviceGroupRepository as unknown as Repository<DeviceGroup>,
+      {} as DataSource,
+      {} as RbacAuditService,
+      authorizationService as unknown as RbacAuthorizationService,
+    );
+
+    const protectedResult = await eligibilityService.getRoleEligibility(
+      'target',
+      'delegated-actor',
+    );
+    expect(
+      protectedResult.data.every(
+        (role) =>
+          role.reason_code === 'protected_target' &&
+          !role.can_assign &&
+          !role.can_remove &&
+          role.allowed_scope_types.length === 0,
+      ),
+    ).toBe(true);
+
+    authorizationService.isProtectedUser.mockResolvedValue(false);
+    const lockedResult = await eligibilityService.getRoleEligibility(
+      'target',
+      'delegated-actor',
+    );
+    expect(lockedResult.data.map((role) => role.reason_code)).toEqual([
+      'protected_role',
+      'role_grants_roles_assign',
+    ]);
+    const selfResult = await eligibilityService.getRoleEligibility(
+      'target',
+      'target',
+    );
+    expect(
+      selfResult.data.every((role) => role.reason_code === 'self_target'),
+    ).toBe(true);
+  });
+
   it('rejects assigning an empty role to device-group scope', async () => {
     const userRepository = repository();
     const roleRepository = repository();
     const rolePermissionRepository = repository();
     const authorizationService = {
       requireSuperAdmin: jest.fn().mockResolvedValue(undefined),
+      getCurrentUser: jest.fn().mockResolvedValue({ isAdmin: true }),
+      requirePermission: jest.fn().mockResolvedValue({
+        global: true,
+        deviceGroupGuids: new Set<string>(),
+      }),
+      isProtectedUser: jest.fn().mockResolvedValue(false),
     };
     userRepository.exist.mockResolvedValue(true);
     roleRepository.find.mockResolvedValue([{ guid: 'empty-role' }] as Role[]);
@@ -476,6 +808,36 @@ describe('UserRoleService', () => {
       ),
     ).rejects.toThrow('device_group scope only supports');
     expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it('classifies an empty device-group assignment as invalid input', async () => {
+    const service = new UserRoleService(
+      repository() as unknown as Repository<User>,
+      repository() as unknown as Repository<Role>,
+      repository() as unknown as Repository<RolePermission>,
+      repository() as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      repository() as unknown as Repository<DeviceGroup>,
+      { transaction: jest.fn() } as unknown as DataSource,
+      {} as RbacAuditService,
+      {} as RbacAuthorizationService,
+    );
+
+    await expect(
+      service.replaceUserRoles(
+        'user-1',
+        {
+          assignments: [
+            {
+              role_guid: 'role-1',
+              scope_type: 'device_group',
+              device_group_guids: [],
+            },
+          ],
+        },
+        'actor',
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
 
@@ -641,10 +1003,10 @@ describe('RbacAuditService', () => {
   it('keeps the catalog protected while exposing only the caller effective grants', () => {
     expect(
       Reflect.getMetadata(
-        REQUIRE_SUPER_ADMIN_KEY,
+        REQUIRE_PERMISSION_KEY,
         PermissionController.prototype.getPermissions,
       ),
-    ).toBe(true);
+    ).toEqual(['roles.view']);
     expect(
       Reflect.getMetadata(
         REQUIRE_SUPER_ADMIN_KEY,
@@ -669,13 +1031,25 @@ describe('RbacAuditService', () => {
     ).toBe(true);
   });
 
-  it('keeps role definitions and user-role assignments super-admin-only', () => {
-    expect(Reflect.getMetadata(REQUIRE_SUPER_ADMIN_KEY, RoleController)).toBe(
-      true,
-    );
+  it('separates delegated role viewing/assignment from owner-only definitions', () => {
     expect(
-      Reflect.getMetadata(REQUIRE_SUPER_ADMIN_KEY, UserRoleController),
+      Reflect.getMetadata(
+        REQUIRE_PERMISSION_KEY,
+        RoleController.prototype.list,
+      ),
+    ).toEqual(['roles.view']);
+    expect(
+      Reflect.getMetadata(
+        REQUIRE_SUPER_ADMIN_KEY,
+        RoleController.prototype.create,
+      ),
     ).toBe(true);
+    expect(
+      Reflect.getMetadata(
+        REQUIRE_PERMISSION_KEY,
+        UserRoleController.prototype.replaceRoles,
+      ),
+    ).toEqual(['roles.assign']);
   });
 
   it('allows group reads without granting membership changes', () => {

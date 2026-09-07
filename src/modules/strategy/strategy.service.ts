@@ -6,7 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { DataSource, Repository, In } from 'typeorm';
 import * as uuid from 'uuid';
 import { Strategy } from './entities/strategy.entity';
 import { Peer } from '../../common/entities/peer.entity';
@@ -39,6 +39,7 @@ export class StrategyService {
     private userRepository: Repository<User>,
     @InjectRepository(DeviceGroup)
     private deviceGroupRepository: Repository<DeviceGroup>,
+    private readonly dataSource: DataSource,
     private readonly rbacAuthorizationService: RbacAuthorizationService,
   ) {}
 
@@ -208,10 +209,15 @@ export class StrategyService {
       take: pageSize,
       order: { username: 'ASC' },
     });
+    const protection =
+      await this.rbacAuthorizationService.getEffectiveProtectionMap(
+        users.map((user) => user.guid),
+      );
     return {
       data: users.map((user) => ({
         guid: user.guid,
         name: user.displayName || user.username,
+        is_protected: protection.get(user.guid) === true,
       })),
       total,
     };
@@ -244,79 +250,131 @@ export class StrategyService {
     actorGuid: string,
   ) {
     const targets = [...new Set(targetGuids)];
-    const scope = await this.rbacAuthorizationService.assertStrategyTargets(
-      actorGuid,
-      targetType,
-      targets,
-    );
-    const strategy = await this.strategyRepository.findOne({
-      where: { guid: strategyGuid },
-    });
-    if (!strategy) {
-      throw new NotFoundException('策略不存在');
-    }
-
     const success: string[] = [];
     const errors: { target_guid: string; reason: string }[] = [];
 
+    if (targetType !== 'device' && targetType !== 'device_group') {
+      await this.rbacAuthorizationService.assertStrategyTargets(
+        actorGuid,
+        targetType,
+        targets,
+      );
+    }
+
     switch (targetType) {
       case 'device': {
-        const peers = await this.peerRepository.find({
-          where: { uuid: In(targets) },
-        });
-        const foundUuids = new Set(peers.map((p) => p.uuid));
-        for (const targetGuid of targets) {
-          if (!foundUuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '设备不存在' });
+        await this.dataSource.transaction(async (manager) => {
+          const scope =
+            await this.rbacAuthorizationService.assertStrategyTargets(
+              actorGuid,
+              targetType,
+              targets,
+              manager,
+            );
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const peers = await manager
+            .getRepository(Peer)
+            .find({ where: { uuid: In(targets) } });
+          const foundUuids = new Set(peers.map((p) => p.uuid));
+          for (const targetGuid of targets) {
+            if (!foundUuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '设备不存在' });
+            }
           }
-        }
-        if (peers.length > 0) {
-          await this.updateAuthorizedDevices(
-            actorGuid,
-            peers.map((peer) => peer.uuid),
-            scope,
-            { strategyGuid },
-          );
-          success.push(...peers.map((p) => p.uuid));
-        }
+          if (peers.length > 0) {
+            const result = await manager.update(
+              Peer,
+              {
+                uuid: In(peers.map((peer) => peer.uuid)),
+                ...(scope.global
+                  ? {}
+                  : { deviceGroupGuid: In([...scope.deviceGroupGuids]) }),
+              },
+              { strategyGuid },
+            );
+            if (result.affected !== peers.length) {
+              await this.rbacAuthorizationService.assertStrategyTargets(
+                actorGuid,
+                targetType,
+                targets,
+                manager,
+              );
+              throw new ConflictException('设备信息已发生变化，请重试');
+            }
+            success.push(...peers.map((p) => p.uuid));
+          }
+        });
         break;
       }
       case 'user': {
-        const users = await this.userRepository.find({
-          where: { guid: In(targets) },
-        });
-        const foundGuids = new Set(users.map((u) => u.guid));
-        for (const targetGuid of targets) {
-          if (!foundGuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '用户不存在' });
-          }
-        }
-        if (users.length > 0) {
-          await this.userRepository.update(
-            { guid: In(users.map((u) => u.guid)) },
-            { strategyGuid },
+        await this.dataSource.transaction(async (manager) => {
+          const users = await manager.getRepository(User).find({
+            where: { guid: In(targets) },
+          });
+          await this.rbacAuthorizationService.assertStrategyTargets(
+            actorGuid,
+            'user',
+            users.map((user) => user.guid),
+            manager,
           );
-          success.push(...users.map((u) => u.guid));
-        }
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const foundGuids = new Set(users.map((u) => u.guid));
+          for (const targetGuid of targets) {
+            if (!foundGuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '用户不存在' });
+            }
+          }
+          if (users.length > 0) {
+            const result = await manager
+              .getRepository(User)
+              .update({ guid: In(users.map((u) => u.guid)) }, { strategyGuid });
+            if (result.affected !== users.length)
+              throw new ConflictException('用户信息已发生变化，请重试');
+            success.push(...users.map((u) => u.guid));
+          }
+        });
         break;
       }
       case 'device_group': {
-        const groups = await this.deviceGroupRepository.find({
-          where: { guid: In(targets) },
-        });
-        const foundGuids = new Set(groups.map((g) => g.guid));
-        for (const targetGuid of targets) {
-          if (!foundGuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '设备组不存在' });
-          }
-        }
-        if (groups.length > 0) {
-          await this.deviceGroupRepository.update(
-            { guid: In(groups.map((g) => g.guid)) },
-            { strategyGuid },
+        await this.dataSource.transaction(async (manager) => {
+          await this.rbacAuthorizationService.assertStrategyTargets(
+            actorGuid,
+            targetType,
+            targets,
+            manager,
           );
-          success.push(...groups.map((g) => g.guid));
-        }
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const groups = await manager
+            .getRepository(DeviceGroup)
+            .find({ where: { guid: In(targets) } });
+          const foundGuids = new Set(groups.map((g) => g.guid));
+          for (const targetGuid of targets) {
+            if (!foundGuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '设备组不存在' });
+            }
+          }
+          if (groups.length > 0) {
+            const result = await manager.update(
+              DeviceGroup,
+              {
+                guid: In(groups.map((g) => g.guid)),
+              },
+              { strategyGuid },
+            );
+            if (result.affected !== groups.length)
+              throw new ConflictException('设备组信息已发生变化，请重试');
+            success.push(...groups.map((g) => g.guid));
+          }
+        });
         break;
       }
       default:
@@ -335,108 +393,151 @@ export class StrategyService {
     actorGuid: string,
   ) {
     const targets = [...new Set(targetGuids)];
-    const scope = await this.rbacAuthorizationService.assertStrategyTargets(
-      actorGuid,
-      targetType,
-      targets,
-    );
     const success: string[] = [];
     const errors: { target_guid: string; reason: string }[] = [];
 
     switch (targetType) {
       case 'device': {
-        const peers = await this.peerRepository.find({
-          where: { uuid: In(targets) },
-        });
-        const existingUuids = new Set(peers.map((peer) => peer.uuid));
-        const assignedPeers = peers.filter(
-          (peer) => peer.strategyGuid === strategyGuid,
-        );
-        const assignedUuids = new Set(assignedPeers.map((peer) => peer.uuid));
-        for (const targetGuid of targets) {
-          if (!existingUuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '设备不存在' });
-          } else if (!assignedUuids.has(targetGuid)) {
-            errors.push({
-              target_guid: targetGuid,
-              reason: '设备未绑定该策略',
-            });
-          }
-        }
-        if (assignedPeers.length > 0) {
-          await this.updateAuthorizedDevices(
-            actorGuid,
-            assignedPeers.map((peer) => peer.uuid),
-            scope,
-            { strategyGuid: null },
-            strategyGuid,
+        await this.dataSource.transaction(async (manager) => {
+          const scope =
+            await this.rbacAuthorizationService.assertStrategyTargets(
+              actorGuid,
+              targetType,
+              targets,
+              manager,
+            );
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const peers = await manager
+            .getRepository(Peer)
+            .find({ where: { uuid: In(targets) } });
+          const existingUuids = new Set(peers.map((peer) => peer.uuid));
+          const assignedPeers = peers.filter(
+            (peer) => peer.strategyGuid === strategyGuid,
           );
-          success.push(...assignedPeers.map((peer) => peer.uuid));
-        }
+          const assignedUuids = new Set(assignedPeers.map((peer) => peer.uuid));
+          for (const targetGuid of targets) {
+            if (!existingUuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '设备不存在' });
+            } else if (!assignedUuids.has(targetGuid)) {
+              errors.push({
+                target_guid: targetGuid,
+                reason: '设备未绑定该策略',
+              });
+            }
+          }
+          if (assignedPeers.length > 0) {
+            const result = await manager.update(
+              Peer,
+              {
+                uuid: In(assignedPeers.map((peer) => peer.uuid)),
+                strategyGuid,
+                ...(scope.global
+                  ? {}
+                  : { deviceGroupGuid: In([...scope.deviceGroupGuids]) }),
+              },
+              { strategyGuid: null },
+            );
+            if (result.affected !== assignedPeers.length)
+              throw new ConflictException('设备信息已发生变化，请重试');
+            success.push(...assignedPeers.map((peer) => peer.uuid));
+          }
+        });
         break;
       }
       case 'user': {
-        const users = await this.userRepository.find({
-          where: { guid: In(targets) },
-        });
-        const existingGuids = new Set(users.map((user) => user.guid));
-        const assignedUsers = users.filter(
-          (user) => user.strategyGuid === strategyGuid,
-        );
-        const assignedGuids = new Set(assignedUsers.map((user) => user.guid));
-        for (const targetGuid of targets) {
-          if (!existingGuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '用户不存在' });
-          } else if (!assignedGuids.has(targetGuid)) {
-            errors.push({
-              target_guid: targetGuid,
-              reason: '用户未绑定该策略',
-            });
-          }
-        }
-        if (assignedUsers.length > 0) {
-          await this.userRepository.update(
-            {
-              guid: In(assignedUsers.map((user) => user.guid)),
-              strategyGuid,
-            },
-            { strategyGuid: null },
+        await this.dataSource.transaction(async (manager) => {
+          const users = await manager.getRepository(User).find({
+            where: { guid: In(targets) },
+          });
+          await this.rbacAuthorizationService.assertStrategyTargets(
+            actorGuid,
+            'user',
+            users.map((user) => user.guid),
+            manager,
           );
-          success.push(...assignedUsers.map((user) => user.guid));
-        }
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const existingGuids = new Set(users.map((user) => user.guid));
+          const assignedUsers = users.filter(
+            (user) => user.strategyGuid === strategyGuid,
+          );
+          const assignedGuids = new Set(assignedUsers.map((user) => user.guid));
+          for (const targetGuid of targets) {
+            if (!existingGuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '用户不存在' });
+            } else if (!assignedGuids.has(targetGuid)) {
+              errors.push({
+                target_guid: targetGuid,
+                reason: '用户未绑定该策略',
+              });
+            }
+          }
+          if (assignedUsers.length > 0) {
+            const result = await manager.getRepository(User).update(
+              {
+                guid: In(assignedUsers.map((user) => user.guid)),
+                strategyGuid,
+              },
+              { strategyGuid: null },
+            );
+            if (result.affected !== assignedUsers.length)
+              throw new ConflictException('用户信息已发生变化，请重试');
+            success.push(...assignedUsers.map((user) => user.guid));
+          }
+        });
         break;
       }
       case 'device_group': {
-        const groups = await this.deviceGroupRepository.find({
-          where: { guid: In(targets) },
-        });
-        const existingGuids = new Set(groups.map((group) => group.guid));
-        const assignedGroups = groups.filter(
-          (group) => group.strategyGuid === strategyGuid,
-        );
-        const assignedGuids = new Set(
-          assignedGroups.map((group) => group.guid),
-        );
-        for (const targetGuid of targets) {
-          if (!existingGuids.has(targetGuid)) {
-            errors.push({ target_guid: targetGuid, reason: '设备组不存在' });
-          } else if (!assignedGuids.has(targetGuid)) {
-            errors.push({
-              target_guid: targetGuid,
-              reason: '设备组未绑定该策略',
-            });
-          }
-        }
-        if (assignedGroups.length > 0) {
-          await this.deviceGroupRepository.update(
-            {
-              guid: In(assignedGroups.map((group) => group.guid)),
-              strategyGuid,
-            },
-            { strategyGuid: null },
+        await this.dataSource.transaction(async (manager) => {
+          await this.rbacAuthorizationService.assertStrategyTargets(
+            actorGuid,
+            targetType,
+            targets,
+            manager,
           );
-          success.push(...assignedGroups.map((group) => group.guid));
-        }
+          const strategy = await manager
+            .getRepository(Strategy)
+            .findOne({ where: { guid: strategyGuid } });
+          if (!strategy) throw new NotFoundException('策略不存在');
+          const groups = await manager
+            .getRepository(DeviceGroup)
+            .find({ where: { guid: In(targets) } });
+          const existingGuids = new Set(groups.map((group) => group.guid));
+          const assignedGroups = groups.filter(
+            (group) => group.strategyGuid === strategyGuid,
+          );
+          const assignedGuids = new Set(
+            assignedGroups.map((group) => group.guid),
+          );
+          for (const targetGuid of targets) {
+            if (!existingGuids.has(targetGuid)) {
+              errors.push({ target_guid: targetGuid, reason: '设备组不存在' });
+            } else if (!assignedGuids.has(targetGuid)) {
+              errors.push({
+                target_guid: targetGuid,
+                reason: '设备组未绑定该策略',
+              });
+            }
+          }
+          if (assignedGroups.length > 0) {
+            const result = await manager.update(
+              DeviceGroup,
+              {
+                guid: In(assignedGroups.map((group) => group.guid)),
+                strategyGuid,
+              },
+              { strategyGuid: null },
+            );
+            if (result.affected !== assignedGroups.length)
+              throw new ConflictException('设备组信息已发生变化，请重试');
+            success.push(...assignedGroups.map((group) => group.guid));
+          }
+        });
         break;
       }
       default:
@@ -553,10 +654,15 @@ export class StrategyService {
           take: pageSize,
           order: { username: 'ASC' },
         });
+        const protection =
+          await this.rbacAuthorizationService.getEffectiveProtectionMap(
+            users.map((user) => user.guid),
+          );
         return {
           data: users.map((u) => ({
             guid: u.guid,
             name: u.displayName || u.username,
+            is_protected: protection.get(u.guid) === true,
           })),
           total,
         };

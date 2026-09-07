@@ -423,8 +423,10 @@ export class AuthService {
     // working after an administrator disables or deletes the account.
     const user = await this.userRepository.findOne({
       where: { guid: payload.sub },
-      select: ['guid', 'status'],
+      select: ['guid', 'status', 'isAdmin'],
     });
-    return user?.status === UserStatus.ACTIVE ? payload : null;
+    return user?.status === UserStatus.ACTIVE
+      ? { ...payload, isAdmin: user.isAdmin }
+      : null;
   }
 }

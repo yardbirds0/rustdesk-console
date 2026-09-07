@@ -9,6 +9,7 @@ import {
   Max,
   MaxLength,
   Min,
+  IsBoolean,
 } from 'class-validator';
 
 export class RoleQueryDto {
@@ -47,6 +48,10 @@ export class CreateRoleDto {
   @IsString({ each: true })
   @MaxLength(100, { each: true })
   permissions: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  protected_account?: boolean;
 }
 
 export class UpdateRoleDto {
@@ -67,4 +72,12 @@ export class UpdateRoleDto {
   @IsString({ each: true })
   @MaxLength(100, { each: true })
   permissions?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  protected_account?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  confirm_protected_account_change?: boolean;
 }

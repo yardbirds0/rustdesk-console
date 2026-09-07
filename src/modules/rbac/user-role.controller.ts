@@ -9,21 +9,31 @@ import {
   Put,
 } from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
-import { RequireSuperAdmin } from './decorators/require-permission.decorator';
+import { RequirePermission } from './decorators/require-permission.decorator';
 import { ReplaceUserRolesDto } from './dto/user-role.dto';
 import { UserRoleService } from './services/user-role.service';
 
 @Controller('users')
-@RequireSuperAdmin()
 export class UserRoleController {
   constructor(private readonly userRoleService: UserRoleService) {}
 
   @Get(':guid/roles')
+  @RequirePermission('roles.assign')
   getRoles(@Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string) {
     return this.userRoleService.getUserRoles(guid);
   }
 
+  @Get(':guid/roles/eligibility')
+  @RequirePermission('roles.assign')
+  getEligibility(
+    @Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    return this.userRoleService.getRoleEligibility(guid, actorGuid);
+  }
+
   @Put(':guid/roles')
+  @RequirePermission('roles.assign')
   @HttpCode(HttpStatus.OK)
   replaceRoles(
     @Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string,

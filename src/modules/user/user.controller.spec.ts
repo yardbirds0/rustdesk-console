@@ -89,4 +89,13 @@ describe('UserController field-owned updates', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(userService.updateUser).not.toHaveBeenCalled();
   });
+
+  it('passes the stable actor guid into the service write boundary', async () => {
+    await controller.updateUser('target', { note: 'updated' }, 'actor-guid');
+    expect(userService.updateUser).toHaveBeenCalledWith(
+      'target',
+      { note: 'updated' },
+      'actor-guid',
+    );
+  });
 });

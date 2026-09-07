@@ -20,6 +20,10 @@ export class Role {
   @Column({ type: 'text', nullable: true })
   note: string | null;
 
+  /** Protected roles make every assigned account protected from delegated administration. */
+  @Column({ default: false })
+  protectedAccount: boolean;
+
   @OneToMany(() => RolePermission, (permission) => permission.role)
   rolePermissions: RolePermission[];
 

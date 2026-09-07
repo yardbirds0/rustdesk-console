@@ -12,33 +12,48 @@ import {
   Query,
 } from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
-import { RequireSuperAdmin } from './decorators/require-permission.decorator';
+import {
+  RequirePermission,
+  RequireSuperAdmin,
+} from './decorators/require-permission.decorator';
 import { CreateRoleDto, RoleQueryDto, UpdateRoleDto } from './dto/role.dto';
 import { RoleService } from './services/role.service';
 
 @Controller('roles')
-@RequireSuperAdmin()
 export class RoleController {
   constructor(private readonly roleService: RoleService) {}
 
   @Get()
+  @RequirePermission('roles.view')
   list(@Query() query: RoleQueryDto) {
     return this.roleService.listRoles(query);
   }
 
   @Get(':guid')
+  @RequirePermission('roles.view')
   get(@Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string) {
     return this.roleService.getRole(guid);
   }
 
   @Post()
   @HttpCode(HttpStatus.OK)
+  @RequireSuperAdmin()
   create(@Body() dto: CreateRoleDto, @CurrentUser('id') actorGuid: string) {
     return this.roleService.createRole(dto, actorGuid);
   }
 
+  @Get(':guid/protection-impact')
+  @RequireSuperAdmin()
+  impact(
+    @Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    return this.roleService.getProtectionImpact(guid, actorGuid);
+  }
+
   @Patch(':guid')
   @HttpCode(HttpStatus.OK)
+  @RequireSuperAdmin()
   update(
     @Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string,
     @Body() dto: UpdateRoleDto,
@@ -49,6 +64,7 @@ export class RoleController {
 
   @Delete(':guid')
   @HttpCode(HttpStatus.OK)
+  @RequireSuperAdmin()
   async remove(
     @Param('guid', new ParseUUIDPipe({ version: '4' })) guid: string,
     @CurrentUser('id') actorGuid: string,

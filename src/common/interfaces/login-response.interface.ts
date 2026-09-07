@@ -19,6 +19,8 @@ export interface LoginResponse {
   passkey_options?: PublicKeyCredentialRequestOptionsJSON;
   /** 用户信息 */
   user?: {
+    /** Stable database identifier */
+    guid: string;
     /** 用户名 */
     name: string;
     /** 显示名称 */

@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, QueryFailedError, Repository } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import { User, UserStatus } from '../modules/user/entities/user.entity';
@@ -27,10 +27,39 @@ export class DatabaseInitService implements OnModuleInit {
     @InjectRepository(OidcAuthState)
     private oidcAuthStateRepository: Repository<OidcAuthState>,
     private readonly userGroupService: UserGroupService,
+    private readonly dataSource: DataSource,
   ) {}
 
   async onModuleInit() {
     const defaultGroup = await this.userGroupService.initializeStorage();
+    const owners = await this.userRepository.count({
+      where: { isAdmin: true },
+    });
+    if (owners > 1) {
+      throw new Error(
+        `Database contains ${owners} system owners; resolve the duplicate isAdmin rows offline before starting the server`,
+      );
+    }
+    // The partial unique index is the database-level owner boundary. Creating
+    // it after the explicit legacy check keeps duplicate historical owners
+    // readable and reports them with the actionable error above.
+    try {
+      await this.dataSource.query(
+        'CREATE UNIQUE INDEX IF NOT EXISTS UQ_users_single_owner ON users (isAdmin) WHERE isAdmin = 1',
+      );
+    } catch (error: unknown) {
+      if (error instanceof QueryFailedError) {
+        const currentOwners = await this.userRepository.count({
+          where: { isAdmin: true },
+        });
+        if (currentOwners > 1) {
+          throw new Error(
+            `Database contains ${currentOwners} system owners; resolve the duplicate isAdmin rows offline before starting the server`,
+          );
+        }
+      }
+      throw error;
+    }
     await this.createDefaultAdmin(defaultGroup.guid);
     await this.createDefaultOidcProviders();
     await this.cleanupExpiredAuthStates();
@@ -69,7 +98,19 @@ export class DatabaseInitService implements OnModuleInit {
       userGroupGuid: defaultGroupGuid,
     });
 
-    await this.userRepository.save(admin);
+    try {
+      await this.userRepository.save(admin);
+    } catch (error: unknown) {
+      // Another process may have won the empty-database race after the
+      // unique index was installed. Treat that loser as an idempotent start.
+      if (error instanceof QueryFailedError) {
+        const owner = await this.userRepository.findOne({
+          where: { isAdmin: true },
+        });
+        if (owner) return;
+      }
+      throw error;
+    }
     this.logger.log(`Default admin user created: ${adminUsername}`);
     this.logger.warn(
       `Please change the default password for user: ${adminUsername}`,

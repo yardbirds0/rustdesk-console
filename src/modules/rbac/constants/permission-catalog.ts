@@ -28,7 +28,9 @@ export type PermissionCode =
   | 'strategies.edit'
   | 'strategies.delete'
   | 'strategies.assign'
-  | 'audit.view';
+  | 'audit.view'
+  | 'roles.view'
+  | 'roles.assign';
 
 export interface PermissionDefinition {
   code: PermissionCode;
@@ -213,6 +215,11 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
     'device_group',
   ),
   definition('audit.view', 'audit', 'view', 'View audit data'),
+  definition('roles.view', 'roles', 'view', 'View roles'),
+  definition('roles.assign', 'roles', 'assign', 'Assign roles', 'global', [
+    'roles.view',
+    'users.view',
+  ]),
 ];
 
 export const PERMISSION_CODES = PERMISSION_CATALOG.map((item) => item.code);

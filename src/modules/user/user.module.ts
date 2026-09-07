@@ -20,6 +20,7 @@ import { SettingsModule } from '../settings/settings.module';
 import { RbacModule } from '../rbac/rbac.module';
 import { Role } from '../rbac/entities/role.entity';
 import { UserRoleAssignment } from '../rbac/entities/user-role-assignment.entity';
+import { LoginSession } from '../auth/entities/login-session.entity';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { UserRoleAssignment } from '../rbac/entities/user-role-assignment.entity
       Strategy,
       Role,
       UserRoleAssignment,
+      LoginSession,
     ]),
     AuthModule,
     UserGroupModule,
