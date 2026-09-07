@@ -17,7 +17,7 @@ import {
   getPermissionRequirements,
   PermissionCode,
   isDeviceGroupScopedPermission,
-  isKnownPermissionCode,
+  isAssignablePermissionCode,
 } from '../constants/permission-catalog';
 import { RbacAuditService } from './rbac-audit.service';
 import { RbacAuthorizationService } from './rbac-authorization.service';
@@ -146,7 +146,7 @@ export class RoleService {
         })
       )
         .map((row) => row.permissionCode)
-        .filter(isKnownPermissionCode)
+        .filter(isAssignablePermissionCode)
         .sort();
       const beforeName = role.name;
       const beforeNote = role.note;
@@ -277,6 +277,7 @@ export class RoleService {
         note: role.note,
         permissions: permissionRows
           .map((permission) => permission.permissionCode)
+          .filter(isAssignablePermissionCode)
           .sort(),
         protected_account: role.protectedAccount === true,
         assignments: assignments
@@ -319,7 +320,7 @@ export class RoleService {
     });
     return rows
       .map((row) => row.permissionCode)
-      .filter(isKnownPermissionCode)
+      .filter(isAssignablePermissionCode)
       .sort();
   }
 
@@ -347,12 +348,13 @@ export class RoleService {
 
   private validatePermissions(permissions: string[]): PermissionCode[] {
     const unique = [...new Set(permissions)];
-    const unknown = unique.filter(
-      (permission) => !isKnownPermissionCode(permission),
+    const systemOnly = unique.filter(
+      (permission) => !isAssignablePermissionCode(permission),
     );
-    if (unknown.length)
-      throw new BadRequestException(`权限码不存在: ${unknown.join(', ')}`);
-    const validated = unique.filter(isKnownPermissionCode).sort();
+    if (systemOnly.length) {
+      throw new BadRequestException(`权限码不可分配: ${systemOnly.join(', ')}`);
+    }
+    const validated = unique.filter(isAssignablePermissionCode).sort();
     const granted = new Set(validated);
     const missing = validated.flatMap((permission) =>
       getPermissionRequirements(permission)
@@ -408,7 +410,7 @@ export class RoleService {
     const result = new Map<string, string[]>();
     for (const row of rows) {
       const list = result.get(row.roleGuid) || [];
-      if (isKnownPermissionCode(row.permissionCode))
+      if (isAssignablePermissionCode(row.permissionCode))
         list.push(row.permissionCode);
       result.set(row.roleGuid, list);
     }

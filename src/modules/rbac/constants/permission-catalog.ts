@@ -32,13 +32,21 @@ export type PermissionCode =
   | 'roles.view'
   | 'roles.assign';
 
+export type SystemPermissionCode =
+  'roles.create' | 'roles.edit' | 'roles.delete';
+
+export type CatalogPermissionCode = PermissionCode | SystemPermissionCode;
+
 export interface PermissionDefinition {
-  code: PermissionCode;
+  code: CatalogPermissionCode;
   resource: string;
   action: string;
   name: string;
   description: string;
   scope: 'global' | 'device_group';
+  /** System-only capabilities are display-only and cannot be stored on roles. */
+  assignable: boolean;
+  system_only: boolean;
   requires?: PermissionCode[];
 }
 
@@ -56,7 +64,24 @@ const definition = (
   name,
   description: `${name} (${code})`,
   scope,
+  assignable: true,
+  system_only: false,
   ...(requires.length ? { requires } : {}),
+});
+
+const systemDefinition = (
+  code: SystemPermissionCode,
+  action: string,
+  name: string,
+): PermissionDefinition => ({
+  code,
+  resource: 'roles',
+  action,
+  name,
+  description: `${name} (${code})`,
+  scope: 'global',
+  assignable: false,
+  system_only: true,
 });
 
 export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
@@ -215,6 +240,9 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
     'device_group',
   ),
   definition('audit.view', 'audit', 'view', 'View audit data'),
+  systemDefinition('roles.create', 'create', 'Create roles'),
+  systemDefinition('roles.edit', 'edit', 'Edit roles'),
+  systemDefinition('roles.delete', 'delete', 'Delete roles'),
   definition('roles.view', 'roles', 'view', 'View roles'),
   definition('roles.assign', 'roles', 'assign', 'Assign roles', 'global', [
     'roles.view',
@@ -222,7 +250,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   ]),
 ];
 
-export const PERMISSION_CODES = PERMISSION_CATALOG.map((item) => item.code);
+export const PERMISSION_CODES: readonly PermissionCode[] =
+  PERMISSION_CATALOG.filter((item) => item.assignable).map(
+    (item) => item.code as PermissionCode,
+  );
 
 export const isDeviceGroupScopedPermission = (
   code: string,
@@ -232,14 +263,14 @@ export const isDeviceGroupScopedPermission = (
       permission.code === code && permission.scope === 'device_group',
   );
 
-export const isKnownPermissionCode = (code: string): code is PermissionCode =>
-  PERMISSION_CODES.includes(code as PermissionCode);
+export const isAssignablePermissionCode = (
+  code: string,
+): code is PermissionCode => PERMISSION_CODES.includes(code as PermissionCode);
 
 const PERMISSION_REQUIREMENTS = new Map(
-  PERMISSION_CATALOG.map((permission) => [
-    permission.code,
-    permission.requires || [],
-  ]),
+  PERMISSION_CATALOG.filter((permission) => permission.assignable).map(
+    (permission) => [permission.code, permission.requires || []],
+  ),
 );
 
 export const getPermissionRequirements = (
@@ -249,7 +280,7 @@ export const getPermissionRequirements = (
 export const filterEffectivePermissionCodes = (
   codes: readonly string[],
 ): PermissionCode[] => {
-  const known = new Set(codes.filter(isKnownPermissionCode));
+  const known = new Set(codes.filter(isAssignablePermissionCode));
   return [...known]
     .filter((code) =>
       getPermissionRequirements(code).every((required) => known.has(required)),

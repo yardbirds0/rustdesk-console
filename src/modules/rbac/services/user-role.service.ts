@@ -19,8 +19,8 @@ import {
 } from '../dto/user-role.dto';
 import {
   filterEffectivePermissionCodes,
+  isAssignablePermissionCode,
   isDeviceGroupScopedPermission,
-  isKnownPermissionCode,
   PERMISSION_CATALOG,
   PermissionCode,
 } from '../constants/permission-catalog';
@@ -81,6 +81,7 @@ export class UserRoleService {
       const grants =
         await this.authorizationService.getEffectivePermissions(actorGuid);
       for (const permission of PERMISSION_CATALOG) {
+        if (!isAssignablePermissionCode(permission.code)) continue;
         const scope = grants.scopes[permission.code];
         if (scope)
           actorScopes.set(permission.code, {
@@ -111,7 +112,8 @@ export class UserRoleService {
           role.protectedAccount === true ||
           permissions.includes('roles.assign');
         let reason_code: string | null = null;
-        if (!owner && selfTarget) reason_code = 'self_target';
+        if (target.isAdmin) reason_code = 'super_admin_target';
+        else if (!owner && selfTarget) reason_code = 'self_target';
         else if (!owner && protectedTarget) reason_code = 'protected_target';
         else if (!owner && locked)
           reason_code = role.protectedAccount
@@ -247,6 +249,9 @@ export class UserRoleService {
       select: ['guid', 'isAdmin'],
     });
     if (!target && !owner) throw new NotFoundException('用户不存在');
+    if (target?.isAdmin) {
+      throw new ForbiddenException('超级管理员不能分配普通角色');
+    }
     if (
       !owner &&
       (userGuid === actorGuid ||
@@ -354,6 +359,9 @@ export class UserRoleService {
         .getRepository(User)
         .findOne({ where: { guid: userGuid }, select: ['guid', 'isAdmin'] });
       if (!currentTarget) throw new NotFoundException('用户不存在');
+      if (currentTarget.isAdmin) {
+        throw new ForbiddenException('超级管理员不能分配普通角色');
+      }
       if (
         !currentOwner &&
         (await this.authorizationService.isProtectedUser(
@@ -619,7 +627,7 @@ export class UserRoleService {
     > = {};
     for (const assignment of assignments) {
       for (const permission of assignment.permissions) {
-        if (!isKnownPermissionCode(permission)) continue;
+        if (!isAssignablePermissionCode(permission)) continue;
         const existing = scopes[permission];
         if (existing?.scope_type === 'global') continue;
         if (!existing || assignment.scopeType === 'global') {
@@ -693,7 +701,7 @@ export class UserRoleService {
     for (const row of rows) {
       // Damaged/legacy rows must never appear as effective permissions or be
       // echoed back as if they were part of the code-owned catalog.
-      if (!isKnownPermissionCode(row.permissionCode)) continue;
+      if (!isAssignablePermissionCode(row.permissionCode)) continue;
       const list = codesByRole.get(row.roleGuid) || [];
       list.push(row.permissionCode);
       codesByRole.set(row.roleGuid, list);

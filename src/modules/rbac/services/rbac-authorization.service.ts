@@ -16,7 +16,7 @@ import { UserRoleAssignmentDeviceGroup } from '../entities/user-role-assignment-
 import {
   filterEffectivePermissionCodes,
   isDeviceGroupScopedPermission,
-  isKnownPermissionCode,
+  isAssignablePermissionCode,
   PERMISSION_CATALOG,
   PermissionCode,
 } from '../constants/permission-catalog';
@@ -84,7 +84,7 @@ export class RbacAuthorizationService {
     manager?: EntityManager,
   ): Promise<PermissionScope> {
     const user = await this.getCurrentUser(userGuid, manager);
-    if (user.isAdmin || !isKnownPermissionCode(permissionCode)) {
+    if (user.isAdmin || !isAssignablePermissionCode(permissionCode)) {
       return {
         global: user.isAdmin === true,
         deviceGroupGuids: new Set<string>(),
@@ -139,7 +139,7 @@ export class RbacAuthorizationService {
     permissionCode: string,
     manager?: EntityManager,
   ): Promise<PermissionScope> {
-    if (!isKnownPermissionCode(permissionCode)) {
+    if (!isAssignablePermissionCode(permissionCode)) {
       throw new ForbiddenException('未知权限');
     }
     const scope = await this.getPermissionScope(

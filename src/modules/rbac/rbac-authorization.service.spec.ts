@@ -328,12 +328,14 @@ describe('RbacAuthorizationService', () => {
     ]);
     rolePermissionRepository.find.mockResolvedValue([
       { roleGuid: 'role-1', permissionCode: 'future.admin' },
+      { roleGuid: 'role-1', permissionCode: 'roles.create' },
       { roleGuid: 'role-1', permissionCode: 'devices.view' },
     ]);
 
     const result = await service.getEffectivePermissions('actor');
     expect(result.permissions).toEqual(['devices.view']);
     expect(result.scopes['future.admin']).toBeUndefined();
+    expect(result.scopes['roles.create']).toBeUndefined();
     expect(
       PERMISSION_CATALOG.map((permission) => permission.code),
     ).not.toContain('future.admin');
@@ -536,6 +538,23 @@ describe('UserRoleService', () => {
       { guid: 'group-1', name: 'Group 1' },
       { guid: 'group-2', name: 'Group 2' },
     ]);
+
+    userRepository.findOne.mockResolvedValue({
+      guid: 'owner',
+      isAdmin: true,
+    });
+    const ownerTarget = await eligibilityService.getRoleEligibility(
+      'owner',
+      'owner',
+    );
+    expect(
+      ownerTarget.data.every(
+        (role) =>
+          role.reason_code === 'super_admin_target' &&
+          !role.can_assign &&
+          !role.can_remove,
+      ),
+    ).toBe(true);
   });
 
   it('computes delegated scope types and group intersections from effective grants', async () => {
@@ -839,6 +858,31 @@ describe('UserRoleService', () => {
       ),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
+
+  it('rejects ordinary role assignments for the virtual super administrator', async () => {
+    const userRepository = repository();
+    userRepository.exist.mockResolvedValue(true);
+    userRepository.findOne.mockResolvedValue({ guid: 'owner', isAdmin: true });
+    const transaction = jest.fn();
+    const service = new UserRoleService(
+      userRepository as unknown as Repository<User>,
+      repository() as unknown as Repository<Role>,
+      repository() as unknown as Repository<RolePermission>,
+      repository() as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      repository() as unknown as Repository<DeviceGroup>,
+      { transaction } as unknown as DataSource,
+      {} as RbacAuditService,
+      {
+        getCurrentUser: jest.fn().mockResolvedValue({ isAdmin: true }),
+      } as unknown as RbacAuthorizationService,
+    );
+
+    await expect(
+      service.replaceUserRoles('owner', { assignments: [] }, 'owner'),
+    ).rejects.toThrow('超级管理员不能分配普通角色');
+    expect(transaction).not.toHaveBeenCalled();
+  });
 });
 
 describe('RoleService', () => {
@@ -902,6 +946,28 @@ describe('RoleService', () => {
     await expect(
       service.updateRole('role-1', { permissions: ['users.edit'] }, 'actor'),
     ).rejects.toThrow('权限依赖缺失');
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects system-only role capabilities in ordinary role payloads', async () => {
+    const roleRepository = repository();
+    roleRepository.findOne.mockResolvedValue({ guid: 'role-1' });
+    const transaction = jest.fn();
+    const service = new RoleService(
+      roleRepository as unknown as Repository<Role>,
+      repository() as unknown as Repository<RolePermission>,
+      repository() as unknown as Repository<UserRoleAssignment>,
+      repository() as unknown as Repository<UserRoleAssignmentDeviceGroup>,
+      { transaction } as unknown as DataSource,
+      {} as RbacAuditService,
+      {
+        requireSuperAdmin: jest.fn().mockResolvedValue(undefined),
+      } as unknown as RbacAuthorizationService,
+    );
+
+    await expect(
+      service.updateRole('role-1', { permissions: ['roles.create'] }, 'owner'),
+    ).rejects.toThrow('权限码不可分配: roles.create');
     expect(transaction).not.toHaveBeenCalled();
   });
 
@@ -1023,6 +1089,39 @@ describe('RbacAuditService', () => {
         (permission) => permission.code === 'strategies.assign',
       )?.requires,
     ).toBeUndefined();
+    expect(
+      new PermissionController({} as RbacAuthorizationService)
+        .getPermissions()
+        .data.filter((permission) => permission.resource === 'roles'),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: 'roles.view',
+          assignable: true,
+          system_only: false,
+        }),
+        expect.objectContaining({
+          code: 'roles.assign',
+          assignable: true,
+          system_only: false,
+        }),
+        expect.objectContaining({
+          code: 'roles.create',
+          assignable: false,
+          system_only: true,
+        }),
+        expect.objectContaining({
+          code: 'roles.edit',
+          assignable: false,
+          system_only: true,
+        }),
+        expect.objectContaining({
+          code: 'roles.delete',
+          assignable: false,
+          system_only: true,
+        }),
+      ]),
+    );
   });
 
   it('keeps global dashboard aggregates super-administrator-only', () => {
