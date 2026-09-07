@@ -36,5 +36,5 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            APP_VERSION=rbac-eefa598
-          tags: ghcr.io/${{ github.repository }}:rbac-eefa598
+            APP_VERSION=rbac-8472143
+          tags: ghcr.io/${{ github.repository }}:rbac-8472143
