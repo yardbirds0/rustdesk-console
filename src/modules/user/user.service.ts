@@ -2,10 +2,11 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { DataSource, Repository, In } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
@@ -29,6 +30,8 @@ import {
   ChangePasswordDto,
 } from './dto/user.dto';
 import { UserGroupService } from '../user-group/user-group.service';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
+import { LoginSession } from '../auth/entities/login-session.entity';
 import { EmailService } from '../email/email.service';
 import { GeneralSettingsService } from '../settings/services/general-settings.service';
 import { getAvatarDir } from '../../common/utils/data-dir.util';
@@ -59,6 +62,10 @@ export class UserService {
     private readonly userGroupService: UserGroupService,
     private readonly emailService: EmailService,
     private readonly generalSettingsService: GeneralSettingsService,
+    private readonly dataSource: DataSource,
+    private readonly authorizationService: RbacAuthorizationService,
+    @InjectRepository(LoginSession)
+    private readonly loginSessionRepository: Repository<LoginSession>,
   ) {}
 
   async getAccessibleUsers(
@@ -107,8 +114,14 @@ export class UserService {
         .take(pageSize)
         .getManyAndCount();
 
+      const protection =
+        await this.authorizationService.getEffectiveProtectionMap(
+          users.map((user) => user.guid),
+        );
       return {
-        data: users.map((user) => this.buildUserResponse(user)),
+        data: users.map((user) =>
+          this.buildUserResponse(user, protection.get(user.guid) === true),
+        ),
         total,
       };
     }
@@ -158,8 +171,14 @@ export class UserService {
       .take(pageSize)
       .getManyAndCount();
 
+    const protection =
+      await this.authorizationService.getEffectiveProtectionMap(
+        users.map((user) => user.guid),
+      );
     return {
-      data: users.map((user) => this.buildUserResponse(user)),
+      data: users.map((user) =>
+        this.buildUserResponse(user, protection.get(user.guid) === true),
+      ),
       total,
     };
   }
@@ -385,61 +404,82 @@ export class UserService {
     };
   }
 
-  async updateUser(guid: string, dto: UpdateUserDto) {
-    const user = await this.userRepository.findOne({
-      where: { guid },
-    });
-    if (!user) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    if (dto.name !== undefined) {
-      const existingUser = await this.userRepository.findOne({
-        where: { username: dto.name },
-      });
-      if (existingUser && existingUser.guid !== guid) {
-        throw new BadRequestException('用户名已存在');
+  async updateUser(guid: string, dto: UpdateUserDto, actorGuid: string) {
+    return this.dataSource.transaction(async (manager) => {
+      const users = manager.getRepository(User);
+      const user = await users.findOne({ where: { guid } });
+      if (!user) throw new NotFoundException('用户不存在');
+      if (dto.is_admin !== undefined) {
+        throw new BadRequestException('系统所有者身份不可修改');
       }
-      user.username = dto.name;
-    }
-
-    if (dto.display_name !== undefined) {
-      user.displayName = dto.display_name || null;
-    }
-
-    if (dto.email !== undefined) {
-      if (dto.email) {
-        const existingEmail = await this.userRepository.findOne({
-          where: { email: dto.email },
+      if (
+        dto.name !== undefined ||
+        dto.display_name !== undefined ||
+        dto.email !== undefined ||
+        dto.note !== undefined
+      ) {
+        await this.authorizationService.assertUserMutation(
+          actorGuid,
+          guid,
+          'users.edit',
+          undefined,
+          manager,
+        );
+      }
+      if (dto.status !== undefined) {
+        await this.authorizationService.assertUserMutation(
+          actorGuid,
+          guid,
+          'users.status',
+          undefined,
+          manager,
+        );
+      }
+      if (dto.user_group_guid !== undefined) {
+        await this.authorizationService.assertUserMutation(
+          actorGuid,
+          guid,
+          'user_groups.membership',
+          undefined,
+          manager,
+        );
+      }
+      const previousStatus = user.status;
+      if (dto.name !== undefined) {
+        const existingUser = await users.findOne({
+          where: { username: dto.name },
         });
-        if (existingEmail && existingEmail.guid !== guid) {
-          throw new BadRequestException('邮箱已存在');
+        if (existingUser && existingUser.guid !== guid) {
+          throw new BadRequestException('用户名已存在');
         }
+        user.username = dto.name;
       }
-      user.email = dto.email || null;
-    }
-
-    if (dto.note !== undefined) {
-      user.note = dto.note;
-    }
-
-    if (dto.status !== undefined) {
-      user.status = dto.status;
-    }
-
-    if (dto.is_admin !== undefined) {
-      user.isAdmin = dto.is_admin;
-    }
-
-    if (dto.user_group_guid !== undefined) {
-      user.userGroupGuid = await this.userGroupService.resolveUserGroupGuid(
-        dto.user_group_guid,
-      );
-    }
-
-    await this.userRepository.save(user);
-
-    return { message: '用户已更新' };
+      if (dto.display_name !== undefined)
+        user.displayName = dto.display_name || null;
+      if (dto.email !== undefined) {
+        if (dto.email) {
+          const existingEmail = await users.findOne({
+            where: { email: dto.email },
+          });
+          if (existingEmail && existingEmail.guid !== guid) {
+            throw new BadRequestException('邮箱已存在');
+          }
+        }
+        user.email = dto.email || null;
+      }
+      if (dto.note !== undefined) user.note = dto.note;
+      if (dto.status !== undefined) user.status = dto.status;
+      if (dto.user_group_guid !== undefined) {
+        user.userGroupGuid = await this.userGroupService.resolveUserGroupGuid(
+          dto.user_group_guid,
+        );
+      }
+      await users.save(user);
+      if (dto.status !== undefined && dto.status !== previousStatus) {
+        await this.revokeActiveTokens([guid], manager);
+      }
+      return { message: '用户已更新' };
+    });
   }
 
   async updateCurrentUser(userId: string, dto: UpdateCurrentUserDto) {
@@ -476,122 +516,161 @@ export class UserService {
   }
 
   async changePassword(userId: string, dto: ChangePasswordDto) {
-    const user = await this.userRepository
-      .createQueryBuilder('user')
-      .where('user.guid = :guid', { guid: userId })
-      .addSelect('user.password')
-      .addSelect('user.thirdAuthType')
-      .getOne();
+    return this.dataSource.transaction(async (manager) => {
+      const user = await manager
+        .getRepository(User)
+        .createQueryBuilder('user')
+        .where('user.guid = :guid', { guid: userId })
+        .addSelect('user.password')
+        .addSelect('user.thirdAuthType')
+        .getOne();
 
-    if (!user) {
-      throw new NotFoundException('用户不存在');
-    }
+      if (!user) throw new NotFoundException('用户不存在');
 
-    if (user.thirdAuthType) {
-      throw new BadRequestException('第三方登录用户不支持修改密码');
-    }
+      if (user.thirdAuthType) {
+        throw new BadRequestException('第三方登录用户不支持修改密码');
+      }
 
-    if (!user.password) {
-      throw new BadRequestException('当前账户未设置密码，请联系管理员');
-    }
+      if (!user.password) {
+        throw new BadRequestException('当前账户未设置密码，请联系管理员');
+      }
 
-    const isPasswordValid = await bcrypt.compare(
-      dto.current_password,
-      user.password,
-    );
-    if (!isPasswordValid) {
-      throw new BadRequestException('当前密码错误');
-    }
+      const isPasswordValid = await bcrypt.compare(
+        dto.current_password,
+        user.password,
+      );
+      if (!isPasswordValid) throw new BadRequestException('当前密码错误');
 
-    user.password = await bcrypt.hash(dto.new_password, 10);
-    await this.userRepository.save(user);
+      user.password = await bcrypt.hash(dto.new_password, 10);
+      await manager.getRepository(User).save(user);
+      await this.revokeActiveTokens([userId], manager);
 
-    return { message: '密码修改成功' };
+      return { message: '密码修改成功' };
+    });
   }
 
-  async updateUserSecurity(guid: string, dto: UpdateUserSecurityDto) {
-    const user = await this.userRepository.findOne({
-      where: { guid },
+  async updateUserSecurity(
+    guid: string,
+    dto: UpdateUserSecurityDto,
+    actorGuid: string,
+  ) {
+    await this.dataSource.transaction(async (manager) => {
+      const users = manager.getRepository(User);
+      const user = await users.findOne({ where: { guid } });
+      if (!user) throw new NotFoundException('用户不存在');
+      await this.authorizationService.assertUserMutation(
+        actorGuid,
+        guid,
+        'users.security',
+        undefined,
+        manager,
+      );
+      const userInfo: UserInfo = user.getUserInfo();
+      userInfo.other = userInfo.other || {};
+      if (dto.tfa_enforce !== undefined)
+        userInfo.other.tfa_enforce = dto.tfa_enforce;
+      if (dto.email_verification !== undefined) {
+        userInfo.email_verification = dto.email_verification;
+      }
+      user.setUserInfo(userInfo);
+      await users.save(user);
+      await this.revokeActiveTokens([guid], manager);
     });
-    if (!user) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    const userInfo: UserInfo = user.getUserInfo();
-    userInfo.other = userInfo.other || {};
-
-    if (dto.tfa_enforce !== undefined) {
-      userInfo.other.tfa_enforce = dto.tfa_enforce;
-    }
-
-    if (dto.email_verification !== undefined) {
-      userInfo.email_verification = dto.email_verification;
-    }
-
-    user.setUserInfo(userInfo);
-    await this.userRepository.save(user);
   }
 
-  async deleteUser(guid: string) {
-    const user = await this.userRepository.findOne({
-      where: { guid },
+  async deleteUser(guid: string, actorGuid: string) {
+    await this.dataSource.transaction(async (manager) => {
+      const users = manager.getRepository(User);
+      const user = await users.findOne({ where: { guid } });
+      if (!user) throw new NotFoundException('用户不存在');
+      await this.authorizationService.assertUserMutation(
+        actorGuid,
+        guid,
+        'users.delete',
+        undefined,
+        manager,
+      );
+      await this.revokeActiveTokens([guid], manager);
+      await users.remove(user);
     });
-    if (!user) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    await this.userRepository.remove(user);
   }
 
-  async forceLogout(userGuids: string[]) {
-    const users = await this.userRepository.find({
-      where: { guid: In(userGuids) },
+  async forceLogout(userGuids: string[], actorGuid: string) {
+    const uniqueGuids = [...new Set(userGuids)];
+    await this.dataSource.transaction(async (manager) => {
+      const users = await manager.getRepository(User).find({
+        where: { guid: In(uniqueGuids) },
+      });
+      if (users.length !== uniqueGuids.length) {
+        throw new NotFoundException('一个或多个用户不存在');
+      }
+      for (const user of users) {
+        await this.authorizationService.assertUserMutation(
+          actorGuid,
+          user.guid,
+          'users.force_logout',
+          undefined,
+          manager,
+        );
+      }
+      await this.revokeActiveTokens(uniqueGuids, manager);
     });
-
-    if (users.length === 0) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    await this.userTokenRepository.update(
-      { userGuid: In(userGuids), isRevoked: false },
-      { isRevoked: true },
-    );
-
     return { message: '强制登出成功' };
   }
 
-  async batchUpdateStatus(dto: BatchStatusDto) {
+  private async revokeActiveTokens(
+    userGuids: string[],
+    manager?: import('typeorm').EntityManager,
+  ): Promise<void> {
+    const uniqueGuids = [...new Set(userGuids)];
+    if (uniqueGuids.length === 0) return;
+
+    const tokenRepository =
+      manager?.getRepository(UserToken) ?? this.userTokenRepository;
+    await tokenRepository.update(
+      { userGuid: In(uniqueGuids), isRevoked: false },
+      { isRevoked: true },
+    );
+    const sessionRepository =
+      manager?.getRepository(LoginSession) ?? this.loginSessionRepository;
+    await sessionRepository.delete({ userGuid: In(uniqueGuids), used: false });
+  }
+
+  async batchUpdateStatus(dto: BatchStatusDto, actorGuid: string) {
     const { user_guids, status } = dto;
-    const users = await this.userRepository.find({
-      where: { guid: In(user_guids) },
-    });
-
-    if (users.length === 0) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    const foundGuids = new Set(users.map((u) => u.guid));
     const succeeded: string[] = [];
     const failed: { guid: string; reason: string }[] = [];
 
-    for (const guid of user_guids) {
-      if (!foundGuids.has(guid)) {
-        failed.push({ guid, reason: 'User not found' });
+    await this.dataSource.transaction(async (manager) => {
+      const users = await manager.getRepository(User).find({
+        where: { guid: In(user_guids) },
+      });
+      if (users.length === 0) throw new NotFoundException('用户不存在');
+      const foundGuids = new Set(users.map((u) => u.guid));
+      for (const guid of user_guids) {
+        if (!foundGuids.has(guid))
+          failed.push({ guid, reason: 'User not found' });
       }
-    }
-
-    const guidsToUpdate = user_guids.filter((guid) => foundGuids.has(guid));
-
-    if (guidsToUpdate.length > 0) {
-      await this.userRepository
-        .createQueryBuilder()
-        .update(User)
-        .set({ status })
-        .where('guid IN (:...guids)', { guids: guidsToUpdate })
-        .execute();
-
-      succeeded.push(...guidsToUpdate);
-    }
+      const guidsToUpdate = user_guids.filter((guid) => foundGuids.has(guid));
+      if (guidsToUpdate.length > 0) {
+        await this.authorizationService.assertUsersMutation(
+          actorGuid,
+          guidsToUpdate,
+          'users.status',
+          manager,
+        );
+        const updateResult = await manager
+          .getRepository(User)
+          .update({ guid: In(guidsToUpdate) }, { status });
+        if (updateResult.affected !== new Set(guidsToUpdate).size) {
+          throw new ConflictException('用户信息已发生变化，请重试');
+        }
+        succeeded.push(...guidsToUpdate);
+        if (status !== UserStatus.ACTIVE) {
+          await this.revokeActiveTokens(guidsToUpdate, manager);
+        }
+      }
+    });
 
     return {
       succeeded,
@@ -602,31 +681,46 @@ export class UserService {
     };
   }
 
-  async batchUpdateSecurity(dto: BatchSecurityDto) {
+  async batchUpdateSecurity(dto: BatchSecurityDto, actorGuid: string) {
     const { user_guids, tfa_enforce, email_verification } = dto;
-    const users = await this.userRepository.find({
-      where: { guid: In(user_guids) },
+    const uniqueGuids = [...new Set(user_guids)];
+
+    await this.dataSource.transaction(async (manager) => {
+      const userRepository = manager.getRepository(User);
+      const users = await userRepository.find({
+        where: { guid: In(uniqueGuids) },
+      });
+
+      if (!users.length || users.length !== uniqueGuids.length) {
+        throw new NotFoundException('用户不存在');
+      }
+
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        uniqueGuids,
+        'users.security',
+        manager,
+      );
+
+      const usersByGuid = new Map(users.map((user) => [user.guid, user]));
+      for (const guid of uniqueGuids) {
+        const user = usersByGuid.get(guid)!;
+        const userInfo: UserInfo = user.getUserInfo();
+        userInfo.other = userInfo.other || {};
+
+        if (tfa_enforce !== undefined) {
+          userInfo.other.tfa_enforce = tfa_enforce;
+        }
+
+        if (email_verification !== undefined) {
+          userInfo.email_verification = email_verification;
+        }
+
+        user.setUserInfo(userInfo);
+        await userRepository.save(user);
+      }
+      await this.revokeActiveTokens(uniqueGuids, manager);
     });
-
-    if (users.length === 0) {
-      throw new NotFoundException('用户不存在');
-    }
-
-    for (const user of users) {
-      const userInfo: UserInfo = user.getUserInfo();
-      userInfo.other = userInfo.other || {};
-
-      if (tfa_enforce !== undefined) {
-        userInfo.other.tfa_enforce = tfa_enforce;
-      }
-
-      if (email_verification !== undefined) {
-        userInfo.email_verification = email_verification;
-      }
-
-      user.setUserInfo(userInfo);
-      await this.userRepository.save(user);
-    }
 
     return { message: '批量安全设置已更新' };
   }
@@ -645,7 +739,7 @@ export class UserService {
     }
   }
 
-  private buildUserResponse(user: User) {
+  private buildUserResponse(user: User, isProtected = user.isAdmin) {
     const response: Record<string, unknown> = {
       guid: user.guid,
       name: user.username,
@@ -654,6 +748,7 @@ export class UserService {
       note: user.note || '',
       status: user.status,
       is_admin: user.isAdmin,
+      is_protected: isProtected,
       user_group_guid: user.userGroupGuid || '',
       user_group_name: user.userGroup?.name || '',
     };

@@ -7,7 +7,9 @@ import {
   Max,
   IsNumber,
   MaxLength,
+  IsDateString,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 
 /**
  * ConnectionAuditDto
@@ -62,4 +64,59 @@ export class UpdateConnectionAuditDto {
   @IsString()
   @MaxLength(256)
   note: string;
+}
+
+export class ActiveConnectionQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100000)
+  current?: number = 1;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  pageSize?: number = 20;
+
+  @IsOptional()
+  @IsString()
+  deviceId?: string;
+}
+
+export class ConnectionAuditQueryDto {
+  @IsOptional()
+  @IsString()
+  deviceId?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(-1)
+  @Max(4)
+  type?: number;
+
+  @IsOptional()
+  @IsDateString()
+  startTime?: string;
+
+  @IsOptional()
+  @IsDateString()
+  endTime?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(1000)
+  pageSize?: number = 10;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100000)
+  current?: number = 1;
 }

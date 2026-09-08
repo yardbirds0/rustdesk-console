@@ -2,7 +2,6 @@ import {
   Controller,
   Post,
   Body,
-  UseGuards,
   Get,
   Query,
   Patch,
@@ -13,12 +12,18 @@ import { Throttle } from '@nestjs/throttler';
 import { AuditService } from './audit.service';
 import {
   ConnectionAuditDto,
+  ActiveConnectionQueryDto,
+  ConnectionAuditQueryDto,
   UpdateConnectionAuditDto,
 } from './dto/connection-audit.dto';
 import { FileAuditDto } from './dto/file-audit.dto';
 import { AlarmAuditDto } from './dto/alarm-audit.dto';
 import { Public } from '../auth/decorators/public.decorator';
-import { AdminGuard } from '../../common/guards/admin.guard';
+import {
+  RequirePermission,
+  RequireSuperAdmin,
+} from '../rbac/decorators/require-permission.decorator';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
 
 /**
  * 审计控制器
@@ -135,6 +140,15 @@ export class AuditsController {
 
   // ============ 审计查询接口（管理端调用，需要认证）============
 
+  @RequirePermission('devices.disconnect')
+  @Get('conn/active')
+  queryActiveConnections(
+    @Query() query: ActiveConnectionQueryDto,
+    @CurrentUser('id') userId: string,
+  ) {
+    return this.auditService.queryActiveConnections(userId, query);
+  }
+
   /**
    * 查询连接审计
    * 查询远程桌面连接的审计记录
@@ -146,7 +160,7 @@ export class AuditsController {
    * - 支持按连接类型过滤（type，-1表示未建立连接）
    *
    * 安全措施：
-   * - 使用AdminGuard进行认证
+   * - 需要 audit.view 权限
    * - 只有管理员可以查询审计记录
    *
    * @param deviceId 被控端设备ID（模糊匹配）
@@ -157,24 +171,13 @@ export class AuditsController {
    * @param current 当前页码
    * @returns 连接审计列表
    */
-  @UseGuards(AdminGuard)
+  @RequirePermission('audit.view')
   @Get('conn')
   async queryConnectionAudits(
-    @Query('deviceId') deviceId?: string,
-    @Query('type') type?: number,
-    @Query('startTime') startTime?: string,
-    @Query('endTime') endTime?: string,
-    @Query('pageSize') pageSize?: number,
-    @Query('current') current?: number,
+    @CurrentUser('id') userId: string,
+    @Query() query: ConnectionAuditQueryDto,
   ) {
-    return await this.auditService.queryConnectionAudits({
-      deviceId,
-      type,
-      startTime,
-      endTime,
-      pageSize,
-      current,
-    });
+    return await this.auditService.queryConnectionAudits(query, userId);
   }
 
   /**
@@ -184,7 +187,7 @@ export class AuditsController {
    * @param id 连接审计记录主键
    * @param dto 更新数据
    */
-  @UseGuards(AdminGuard)
+  @RequireSuperAdmin()
   @Patch('conn/:id')
   async updateConnectionAudit(
     @Param('id', ParseIntPipe) id: number,
@@ -209,7 +212,7 @@ export class AuditsController {
    * - 支持按文件传输类型过滤（type: 0-发送, 1-接收）
    *
    * 安全措施：
-   * - 使用AdminGuard进行认证
+   * - 需要 audit.view 权限
    * - 只有管理员可以查询审计记录
    *
    * @param deviceId 被控端设备ID（模糊匹配）
@@ -220,7 +223,7 @@ export class AuditsController {
    * @param current 当前页码
    * @returns 文件审计列表
    */
-  @UseGuards(AdminGuard)
+  @RequirePermission('audit.view')
   @Get('file')
   async queryFileAudits(
     @Query('deviceId') deviceId?: string,
@@ -251,7 +254,7 @@ export class AuditsController {
    * - 支持按告警类型过滤（type: 0-IP白名单, 1-超30次尝试, 2-1分钟6次尝试, 6-IPv6前缀超限, 7-终端OS登录backoff, 8-终端OS登录并发超限）
    *
    * 安全措施：
-   * - 使用AdminGuard进行认证
+   * - 需要 audit.view 权限
    * - 只有管理员可以查询审计记录
    *
    * @param deviceId 被控端设备ID（模糊匹配）
@@ -262,7 +265,7 @@ export class AuditsController {
    * @param current 当前页码
    * @returns 告警审计列表
    */
-  @UseGuards(AdminGuard)
+  @RequirePermission('audit.view')
   @Get('alarm')
   async queryAlarmAudits(
     @Query('deviceId') deviceId?: string,
@@ -292,7 +295,7 @@ export class AuditsController {
    * - 支持按创建时间过滤
    *
    * 安全措施：
-   * - 使用AdminGuard进行认证
+   * - 需要 audit.view 权限
    * - 只有管理员可以查询审计记录
    *
    * @param operator 操作人（模糊匹配）
@@ -301,7 +304,7 @@ export class AuditsController {
    * @param created_at 创建时间（UTC时间字符串）
    * @returns 控制台审计列表
    */
-  @UseGuards(AdminGuard)
+  @RequirePermission('audit.view')
   @Get('console')
   queryConsoleAudits(
     @Query('operator') operator?: string,

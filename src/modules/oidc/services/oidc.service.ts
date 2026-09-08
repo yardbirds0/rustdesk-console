@@ -638,6 +638,7 @@ export class OidcService {
       access_token: authState.accessToken,
       type: 'access_token',
       user: {
+        guid: user.guid,
         name: user.username,
         email: user.email || undefined,
         note: user.note || undefined,

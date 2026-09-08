@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, FindOptionsWhere } from 'typeorm';
+import { Repository, FindOptionsWhere, In } from 'typeorm';
 import { ConnectionAudit, ConnType } from './entities/connection-audit.entity';
 import { FileAudit } from './entities/file-audit.entity';
 import { AlarmAudit } from './entities/alarm-audit.entity';
@@ -8,6 +8,11 @@ import { ConnectionAuditDto } from './dto/connection-audit.dto';
 import { UpdateConnectionAuditDto } from './dto/connection-audit.dto';
 import { FileAuditDto } from './dto/file-audit.dto';
 import { AlarmAuditDto } from './dto/alarm-audit.dto';
+import { RbacAuditService } from '../rbac/services/rbac-audit.service';
+import { ActiveConnection } from '../heartbeat/entities/active-connection.entity';
+import { Peer } from '../../common/entities/peer.entity';
+import { ActiveConnectionQueryDto } from './dto/connection-audit.dto';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 
 @Injectable()
 /**
@@ -32,6 +37,12 @@ export class AuditService {
     private readonly fileAuditRepository: Repository<FileAudit>,
     @InjectRepository(AlarmAudit)
     private readonly alarmAuditRepository: Repository<AlarmAudit>,
+    @InjectRepository(ActiveConnection)
+    private readonly activeConnectionRepository: Repository<ActiveConnection>,
+    @InjectRepository(Peer)
+    private readonly peerRepository: Repository<Peer>,
+    private readonly rbacAuditService: RbacAuditService,
+    private readonly rbacAuthorizationService: RbacAuthorizationService,
   ) {}
 
   /**
@@ -277,14 +288,17 @@ export class AuditService {
    * @param filters 过滤条件
    * @returns 连接审计列表
    */
-  async queryConnectionAudits(filters: {
-    deviceId?: string;
-    type?: number;
-    startTime?: string;
-    endTime?: string;
-    pageSize?: number;
-    current?: number;
-  }) {
+  async queryConnectionAudits(
+    filters: {
+      deviceId?: string;
+      type?: number;
+      startTime?: string;
+      endTime?: string;
+      pageSize?: number;
+      current?: number;
+    },
+    actorGuid: string,
+  ) {
     const {
       deviceId,
       type,
@@ -340,10 +354,120 @@ export class AuditService {
 
     const [data, total] = await queryBuilder.getManyAndCount();
 
-    return {
+    const disconnectable = await this.getDisconnectableConnectionKeys(
+      actorGuid,
       data,
+    );
+
+    return {
+      data: data.map((connection) => ({
+        ...connection,
+        can_disconnect:
+          connection.connId !== null &&
+          connection.closedAt === null &&
+          disconnectable.has(
+            this.connectionKey(connection.deviceUuid, connection.connId),
+          ),
+      })),
       total,
     };
+  }
+
+  async queryActiveConnections(
+    actorGuid: string,
+    query: ActiveConnectionQueryDto,
+  ) {
+    const { current = 1, pageSize = 20, deviceId } = query;
+    const scope = await this.rbacAuthorizationService.requirePermission(
+      actorGuid,
+      'devices.disconnect',
+    );
+    const queryBuilder = this.activeConnectionRepository
+      .createQueryBuilder('activeConnection')
+      .innerJoin(Peer, 'peer', 'peer.uuid = activeConnection.deviceUuid');
+
+    if (!scope.global) {
+      if (scope.deviceGroupGuids.size) {
+        queryBuilder.andWhere(
+          'peer.deviceGroupGuid IN (:...deviceGroupGuids)',
+          { deviceGroupGuids: [...scope.deviceGroupGuids] },
+        );
+      } else {
+        queryBuilder.andWhere('1 = 0');
+      }
+    }
+    const trimmedDeviceId = deviceId?.trim();
+    if (trimmedDeviceId) {
+      queryBuilder.andWhere('peer.id LIKE :deviceId', {
+        deviceId: `%${trimmedDeviceId}%`,
+      });
+    }
+
+    const total = await queryBuilder.getCount();
+    const rows = await queryBuilder
+      .select('activeConnection.deviceUuid', 'deviceUuid')
+      .addSelect('activeConnection.connId', 'connId')
+      .addSelect('peer.id', 'deviceId')
+      .orderBy('peer.id', 'ASC')
+      .addOrderBy('activeConnection.connId', 'ASC')
+      .offset((current - 1) * pageSize)
+      .limit(pageSize)
+      .getRawMany<{
+        deviceId: string;
+        deviceUuid: string;
+        connId: string | number;
+      }>();
+
+    return {
+      data: rows.map((row) => ({
+        deviceId: row.deviceId,
+        deviceUuid: row.deviceUuid,
+        connId: Number(row.connId),
+        can_disconnect: true as const,
+      })),
+      total,
+    };
+  }
+
+  private async getDisconnectableConnectionKeys(
+    actorGuid: string,
+    connections: ConnectionAudit[],
+  ): Promise<Set<string>> {
+    const deviceUuids = [
+      ...new Set(connections.map(({ deviceUuid }) => deviceUuid)),
+    ];
+    if (deviceUuids.length === 0) return new Set();
+
+    const scope = await this.rbacAuthorizationService.getPermissionScope(
+      actorGuid,
+      'devices.disconnect',
+    );
+    if (!scope.global && scope.deviceGroupGuids.size === 0) return new Set();
+
+    const peers = await this.peerRepository.find({
+      where: {
+        uuid: In(deviceUuids),
+        ...(scope.global
+          ? {}
+          : { deviceGroupGuid: In([...scope.deviceGroupGuids]) }),
+      },
+      select: ['uuid'],
+    });
+    if (peers.length === 0) return new Set();
+
+    const activeConnections = await this.activeConnectionRepository.find({
+      where: { deviceUuid: In(peers.map(({ uuid }) => uuid)) },
+      select: ['deviceUuid', 'connId'],
+    });
+    return new Set(
+      activeConnections.map(({ deviceUuid, connId }) =>
+        this.connectionKey(deviceUuid, connId),
+      ),
+    );
+  }
+
+  private connectionKey(deviceUuid: string, connId: string | number): string {
+    return `${deviceUuid}:${String(connId)}`;
   }
 
   /**
@@ -491,16 +615,12 @@ export class AuditService {
    * @param filters 过滤条件
    * @returns 控制台审计列表
    */
-  queryConsoleAudits(_filters: {
+  queryConsoleAudits(filters: {
     operator?: string;
     pageSize?: number;
     current?: number;
     created_at?: string;
   }) {
-    // 控制台审计暂时没有实体，返回空列表
-    return {
-      data: [],
-      total: 0,
-    };
+    return this.rbacAuditService.query(filters);
   }
 }

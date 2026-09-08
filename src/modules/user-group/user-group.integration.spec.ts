@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { Server } from 'node:http';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   INestApplication,
@@ -13,8 +14,9 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { DataSource, Repository } from 'typeorm';
 import request from 'supertest';
-import { AdminGuard } from '../../common/guards/admin.guard';
+import * as bcrypt from 'bcryptjs';
 import { DatabaseInitService } from '../../database/database-init.service';
+import { AdminGuard } from '../../common/guards/admin.guard';
 import { AddressBookPeerTag } from '../address-book/entities/address-book-peer-tag.entity';
 import { AddressBookPeer } from '../address-book/entities/address-book-peer.entity';
 import {
@@ -31,6 +33,7 @@ import { AddressBookRuleService } from '../address-book/services/address-book-ru
 import { DeviceGroupUserPermission } from '../device-group/entities/device-group-user-permission.entity';
 import { UserUserPermission } from '../device-group/entities/user-user-permission.entity';
 import { AuthService } from '../auth/services/auth.service';
+import { LoginSession } from '../auth/entities/login-session.entity';
 import { LdapService } from '../ldap/ldap.service';
 import { OidcService } from '../oidc/services/oidc.service';
 import { Strategy } from '../strategy/entities/strategy.entity';
@@ -45,6 +48,8 @@ import { UserGroupMembersDto, UserGroupQueryDto } from './dto/user-group.dto';
 import { UserGroup } from './entities/user-group.entity';
 import { UserGroupController } from './user-group.controller';
 import { UserGroupService } from './user-group.service';
+import { REQUIRE_PERMISSION_KEY } from '../rbac/decorators/require-permission.decorator';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 
 interface UserGroupHttpBody {
   guid: string;
@@ -75,6 +80,11 @@ describe('User group integration', () => {
   let permissionService: AddressBookPermissionService;
   let ruleService: AddressBookRuleService;
   let userService: UserService;
+  let authorizationService: {
+    assertUsersMutation: jest.Mock;
+    getEffectiveProtectionMap: jest.Mock;
+    isProtectedUser: jest.Mock;
+  };
 
   beforeEach(async () => {
     dataSource = new DataSource({
@@ -87,6 +97,7 @@ describe('User group integration', () => {
         UserGroup,
         User,
         UserToken,
+        LoginSession,
         Strategy,
         AddressBook,
         AddressBookPeer,
@@ -101,12 +112,18 @@ describe('User group integration', () => {
     userRepository = dataSource.getRepository(User);
     ruleRepository = dataSource.getRepository(AddressBookRule);
     addressBookRepository = dataSource.getRepository(AddressBook);
+    authorizationService = {
+      assertUsersMutation: jest.fn().mockResolvedValue(undefined),
+      getEffectiveProtectionMap: jest.fn().mockResolvedValue(new Map()),
+      isProtectedUser: jest.fn().mockResolvedValue(false),
+    };
 
     userGroupService = new UserGroupService(
       groupRepository,
       userRepository,
       ruleRepository,
       dataSource,
+      authorizationService as unknown as RbacAuthorizationService,
     );
     permissionService = new AddressBookPermissionService(
       addressBookRepository,
@@ -117,6 +134,7 @@ describe('User group integration', () => {
       ruleRepository,
       addressBookRepository,
       userRepository,
+      groupRepository,
       permissionService,
       userGroupService,
       dataSource,
@@ -142,6 +160,9 @@ describe('User group integration', () => {
         getWebAuthnSettings: () =>
           Promise.resolve({ enabled: true, rpName: 'RustDesk Console' }),
       } as unknown as GeneralSettingsService,
+      dataSource,
+      authorizationService as unknown as RbacAuthorizationService,
+      dataSource.getRepository(LoginSession),
     );
   });
 
@@ -268,7 +289,11 @@ describe('User group integration', () => {
     const alice = await createUser('alice', defaultGroup.guid);
     const bob = await createUser('bob', defaultGroup.guid);
     await expect(
-      userGroupService.moveUsers(operations.guid, [alice.guid, randomUUID()]),
+      userGroupService.moveUsers(
+        operations.guid,
+        [alice.guid, randomUUID()],
+        'actor',
+      ),
     ).rejects.toThrow('一个或多个用户不存在');
     expect(
       (await userRepository.findOneByOrFail({ guid: alice.guid }))
@@ -276,7 +301,11 @@ describe('User group integration', () => {
     ).toBe(defaultGroup.guid);
 
     await expect(
-      userGroupService.moveUsers(operations.guid, [alice.guid, bob.guid]),
+      userGroupService.moveUsers(
+        operations.guid,
+        [alice.guid, bob.guid],
+        'actor',
+      ),
     ).resolves.toMatchObject({ moved_user_count: 2 });
 
     const groups = await userGroupService.getGroups({
@@ -346,6 +375,122 @@ describe('User group integration', () => {
     ).toBe(selectedGroup.guid);
   });
 
+  it('updates user security as one strict batch', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const alice = await createUser('security-alice', defaultGroup.guid);
+    const bob = await createUser('security-bob', defaultGroup.guid);
+
+    await expect(
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [alice.guid, alice.guid, bob.guid],
+          tfa_enforce: true,
+          email_verification: true,
+        },
+        alice.guid,
+      ),
+    ).resolves.toEqual({ message: '批量安全设置已更新' });
+
+    for (const guid of [alice.guid, bob.guid]) {
+      const info = (
+        await userRepository.findOneByOrFail({ guid })
+      ).getUserInfo();
+      expect(info.other?.tfa_enforce).toBe(true);
+      expect(info.email_verification).toBe(true);
+    }
+
+    await expect(
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [alice.guid, randomUUID()],
+          tfa_enforce: false,
+        },
+        alice.guid,
+      ),
+    ).rejects.toThrow('用户不存在');
+    expect(
+      (await userRepository.findOneByOrFail({ guid: alice.guid })).getUserInfo()
+        .other?.tfa_enforce,
+    ).toBe(true);
+  });
+
+  it('changes a password and atomically revokes tokens and pending sessions', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const user = await createUser('password-user', defaultGroup.guid);
+    user.password = await bcrypt.hash('old-password', 10);
+    await userRepository.save(user);
+    await dataSource.getRepository(UserToken).save({
+      guid: randomUUID(),
+      userGuid: user.guid,
+      jti: randomUUID(),
+      expiresAt: new Date(Date.now() + 60_000),
+      isRevoked: false,
+    });
+    await dataSource.getRepository(LoginSession).save({
+      guid: randomUUID(),
+      userGuid: user.guid,
+      method: 'tfa',
+      expiresAt: new Date(Date.now() + 60_000),
+      used: false,
+    });
+
+    await userService.changePassword(user.guid, {
+      current_password: 'old-password',
+      new_password: 'new-password',
+    });
+
+    expect(
+      (
+        await dataSource
+          .getRepository(UserToken)
+          .findOneBy({ userGuid: user.guid })
+      )?.isRevoked,
+    ).toBe(true);
+    expect(
+      await dataSource.getRepository(LoginSession).countBy({
+        userGuid: user.guid,
+        used: false,
+      }),
+    ).toBe(0);
+    const reloaded = await userRepository
+      .createQueryBuilder('user')
+      .where('user.guid = :guid', { guid: user.guid })
+      .addSelect('user.password')
+      .getOneOrFail();
+    expect(await bcrypt.compare('new-password', reloaded.password)).toBe(true);
+  });
+
+  it('rolls back every user security change when a later update fails', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const first = await createUser('security-first', defaultGroup.guid);
+    const second = await createUser('security-second', defaultGroup.guid);
+    await dataSource.query(
+      `CREATE TRIGGER fail_second_security_update
+       BEFORE UPDATE OF info ON users
+       WHEN OLD.guid = '${second.guid}'
+       BEGIN
+         SELECT RAISE(ABORT, 'forced security update failure');
+       END`,
+    );
+
+    await expect(
+      userService.batchUpdateSecurity(
+        {
+          user_guids: [first.guid, second.guid],
+          tfa_enforce: true,
+        },
+        first.guid,
+      ),
+    ).rejects.toThrow('forced security update failure');
+
+    for (const guid of [first.guid, second.guid]) {
+      expect(
+        (await userRepository.findOneByOrFail({ guid })).getUserInfo().other
+          ?.tfa_enforce,
+      ).toBeUndefined();
+    }
+  });
+
   it('assigns the default group in admin seed, registration, LDAP JIT, and OIDC JIT paths', async () => {
     const defaultGroup = await userGroupService.initializeStorage();
     const authService = new AuthService(
@@ -366,6 +511,7 @@ describe('User group integration', () => {
       undefined as never,
       undefined as never,
       userGroupService,
+      dataSource,
     );
     const ldapService = new LdapService(
       userRepository,
@@ -468,7 +614,7 @@ describe('User group integration', () => {
     );
 
     await expect(
-      userGroupService.deleteGroup(temporaryGroup.guid),
+      userGroupService.deleteGroup(temporaryGroup.guid, 'actor'),
     ).resolves.toEqual({
       message: '用户组删除成功',
       moved_user_count: 1,
@@ -487,8 +633,59 @@ describe('User group integration', () => {
       }),
     ).toBe(0);
     await expect(
-      userGroupService.deleteGroup(defaultGroup.guid),
+      userGroupService.deleteGroup(defaultGroup.guid, 'actor'),
     ).rejects.toThrow('默认用户组不能删除');
+  });
+
+  it('protects administrator members on move and group deletion paths', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const protectedGroup = await userGroupService.createGroup({
+      name: 'Protected administrators',
+    });
+    const administrator = await createUser(
+      'protected-administrator',
+      protectedGroup.guid,
+    );
+    administrator.isAdmin = true;
+    await userRepository.save(administrator);
+
+    authorizationService.assertUsersMutation.mockRejectedValueOnce(
+      new ForbiddenException('不能修改超级管理员'),
+    );
+    await expect(
+      userGroupService.moveUsers(
+        defaultGroup.guid,
+        [administrator.guid],
+        'actor',
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(
+      (await userRepository.findOneByOrFail({ guid: administrator.guid }))
+        .userGroupGuid,
+    ).toBe(protectedGroup.guid);
+
+    authorizationService.assertUsersMutation.mockRejectedValueOnce(
+      new ForbiddenException('不能修改超级管理员'),
+    );
+    await expect(
+      userGroupService.deleteGroup(protectedGroup.guid, 'actor'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(
+      await groupRepository.findOneBy({ guid: protectedGroup.guid }),
+    ).not.toBeNull();
+
+    expect(authorizationService.assertUsersMutation).toHaveBeenNthCalledWith(
+      1,
+      'actor',
+      [administrator.guid],
+      'user_groups.membership',
+    );
+    expect(authorizationService.assertUsersMutation).toHaveBeenNthCalledWith(
+      2,
+      'actor',
+      [administrator.guid],
+      'user_groups.delete',
+    );
   });
 
   it('rolls back member and rule changes when group deletion fails', async () => {
@@ -515,7 +712,7 @@ describe('User group integration', () => {
     );
 
     await expect(
-      userGroupService.deleteGroup(protectedGroup.guid),
+      userGroupService.deleteGroup(protectedGroup.guid, 'actor'),
     ).rejects.toThrow('forced delete failure');
     expect(
       (await userRepository.findOneByOrFail({ guid: member.guid }))
@@ -546,6 +743,31 @@ describe('User group integration', () => {
     await createRule(addressBook.guid, null, null, ShareRule.READ_WRITE);
 
     await expect(
+      ruleService.getWebSharedAddressBook(addressBook.guid, owner.guid),
+    ).resolves.toMatchObject({
+      guid: addressBook.guid,
+      rule: ShareRule.FULL_CONTROL,
+      is_owner: true,
+    });
+    await expect(
+      ruleService.getWebSharedAddressBook(addressBook.guid, member.guid),
+    ).resolves.toMatchObject({
+      guid: addressBook.guid,
+      rule: ShareRule.FULL_CONTROL,
+      is_owner: false,
+    });
+    const everyoneAccess = await ruleService.getWebSharedAddressBook(
+      addressBook.guid,
+      outsider.guid,
+    );
+    expect(everyoneAccess).toMatchObject({
+      guid: addressBook.guid,
+      rule: ShareRule.READ_WRITE,
+      is_owner: false,
+    });
+    expect(everyoneAccess).not.toHaveProperty('info');
+
+    await expect(
       permissionService.checkAddressBookAccess(
         addressBook.guid,
         owner.guid,
@@ -574,7 +796,7 @@ describe('User group integration', () => {
       ),
     ).rejects.toBeInstanceOf(ForbiddenException);
 
-    await userGroupService.moveUsers(guests.guid, [member.guid]);
+    await userGroupService.moveUsers(guests.guid, [member.guid], 'actor');
     await expect(
       permissionService.checkAddressBookAccess(
         addressBook.guid,
@@ -589,6 +811,108 @@ describe('User group integration', () => {
         ShareRule.READ_WRITE,
       ),
     ).resolves.toMatchObject({ guid: addressBook.guid });
+  });
+
+  it('deletes address-book rules as one strict batch', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const owner = await createUser('rule-delete-owner', defaultGroup.guid);
+    const firstBook = await createAddressBook(owner.guid, 'First delete book');
+    const secondBook = await createAddressBook(
+      owner.guid,
+      'Second delete book',
+    );
+    const first = await createRule(firstBook.guid, null, null, ShareRule.READ);
+    const second = await createRule(
+      secondBook.guid,
+      null,
+      null,
+      ShareRule.READ,
+    );
+
+    await expect(
+      ruleService.deleteRules(['not-a-uuid'], owner.guid),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(await ruleRepository.findOneBy({ guid: first.guid })).not.toBeNull();
+
+    await expect(
+      ruleService.deleteRules([first.guid, randomUUID()], owner.guid),
+    ).rejects.toThrow('未找到任何规则');
+    expect(await ruleRepository.findOneBy({ guid: first.guid })).not.toBeNull();
+
+    await expect(
+      ruleService.deleteRules(
+        [first.guid, first.guid, second.guid],
+        owner.guid,
+      ),
+    ).resolves.toEqual({ message: '删除成功' });
+    expect(await ruleRepository.findOneBy({ guid: first.guid })).toBeNull();
+    expect(await ruleRepository.findOneBy({ guid: second.guid })).toBeNull();
+  });
+
+  it('checks every address-book ACL before deleting any rule', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const owner = await createUser('rule-delete-authorized', defaultGroup.guid);
+    const otherOwner = await createUser(
+      'rule-delete-unauthorized',
+      defaultGroup.guid,
+    );
+    const authorizedBook = await createAddressBook(owner.guid);
+    const unauthorizedBook = await createAddressBook(otherOwner.guid);
+    const authorizedRule = await createRule(
+      authorizedBook.guid,
+      null,
+      null,
+      ShareRule.READ,
+    );
+    const unauthorizedRule = await createRule(
+      unauthorizedBook.guid,
+      null,
+      null,
+      ShareRule.READ,
+    );
+
+    await expect(
+      ruleService.deleteRules(
+        [authorizedRule.guid, unauthorizedRule.guid],
+        owner.guid,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(
+      await ruleRepository.findOneBy({ guid: authorizedRule.guid }),
+    ).not.toBeNull();
+    expect(
+      await ruleRepository.findOneBy({ guid: unauthorizedRule.guid }),
+    ).not.toBeNull();
+  });
+
+  it('rolls back every address-book rule when a later delete fails', async () => {
+    const defaultGroup = await userGroupService.initializeStorage();
+    const owner = await createUser('rule-delete-rollback', defaultGroup.guid);
+    const firstBook = await createAddressBook(owner.guid);
+    const secondBook = await createAddressBook(owner.guid);
+    const first = await createRule(firstBook.guid, null, null, ShareRule.READ);
+    const second = await createRule(
+      secondBook.guid,
+      null,
+      null,
+      ShareRule.READ,
+    );
+    await dataSource.query(
+      `CREATE TRIGGER fail_second_rule_delete
+       BEFORE DELETE ON address_book_rules
+       WHEN OLD.guid = '${second.guid}'
+       BEGIN
+         SELECT RAISE(ABORT, 'forced rule delete failure');
+       END`,
+    );
+
+    await expect(
+      ruleService.deleteRules([first.guid, second.guid], owner.guid),
+    ).rejects.toThrow('forced rule delete failure');
+    expect(await ruleRepository.findOneBy({ guid: first.guid })).not.toBeNull();
+    expect(
+      await ruleRepository.findOneBy({ guid: second.guid }),
+    ).not.toBeNull();
   });
 
   it('validates group rules and aggregates shared address books without duplicates', async () => {
@@ -654,7 +978,7 @@ describe('User group integration', () => {
       data: [{ guid: addressBook.guid, rule: ShareRule.READ }],
     });
 
-    await userGroupService.moveUsers(guests.guid, [member.guid]);
+    await userGroupService.moveUsers(guests.guid, [member.guid], 'actor');
     const movedMemberBooks = await ruleService.getSharedAddressBooks(
       member.guid,
       { current: 1, pageSize: 20 },
@@ -663,6 +987,7 @@ describe('User group integration', () => {
   });
 
   it('separates private, shared, and protocol address book profiles', async () => {
+    const sharedPassword = 'managed-shared-secret';
     const defaultGroup = await userGroupService.initializeStorage();
     const operators = await userGroupService.createGroup({
       name: 'Address book operators',
@@ -677,6 +1002,8 @@ describe('User group integration', () => {
     const sharedGuid = await ruleService.addSharedAddressBook(
       'Managed shared',
       owner.guid,
+      undefined,
+      sharedPassword,
     );
     await ruleService.createRule(
       {
@@ -708,6 +1035,8 @@ describe('User group integration', () => {
       [legacyShared.guid, true],
       [sharedGuid, true],
     ]);
+    expect(JSON.stringify(ownerSharedProfiles)).not.toContain(sharedPassword);
+    expect(ownerSharedProfiles.data.some((book) => 'info' in book)).toBe(false);
 
     const memberSharedProfiles = await ruleService.getWebSharedAddressBooks(
       member.guid,
@@ -719,6 +1048,28 @@ describe('User group integration', () => {
       [legacyShared.guid, false],
       [sharedGuid, false],
     ]);
+    expect(JSON.stringify(memberSharedProfiles)).not.toContain(sharedPassword);
+    expect(memberSharedProfiles.data.some((book) => 'info' in book)).toBe(
+      false,
+    );
+
+    const memberSharedProfile = await ruleService.getWebSharedAddressBook(
+      sharedGuid,
+      member.guid,
+    );
+    expect(memberSharedProfile).toMatchObject({
+      guid: sharedGuid,
+      name: 'Managed shared',
+      rule: ShareRule.READ_WRITE,
+      is_owner: false,
+    });
+    expect(memberSharedProfile).not.toHaveProperty('info');
+    expect(JSON.stringify(memberSharedProfile)).not.toContain(sharedPassword);
+
+    const outsider = await createUser('profile-outsider', defaultGroup.guid);
+    await expect(
+      ruleService.getWebSharedAddressBook(sharedGuid, outsider.guid),
+    ).rejects.toThrow('共享地址簿不存在');
 
     const ownerProtocolProfiles = await ruleService.getSharedAddressBooks(
       owner.guid,
@@ -729,6 +1080,9 @@ describe('User group integration', () => {
       sharedGuid,
       privateGuid,
     ]);
+    expect(
+      ownerProtocolProfiles.data.find((book) => book.guid === sharedGuid),
+    ).toMatchObject({ info: { password: sharedPassword } });
 
     await ruleService.updateCustomAddressBook(
       privateGuid,
@@ -748,13 +1102,7 @@ describe('User group integration', () => {
     ).toBeNull();
   });
 
-  it('publishes validated DTOs and protects every user-group route with AdminGuard', async () => {
-    const guards = Reflect.getMetadata(
-      GUARDS_METADATA,
-      UserGroupController,
-    ) as unknown[];
-    expect(guards).toContain(AdminGuard);
-
+  it('publishes validated DTOs and declares permissions on every admin route', async () => {
     const validLegacyCreate = plainToInstance(CreateUserDto, {
       name: 'new-user',
       password: 'test-password',
@@ -799,20 +1147,43 @@ describe('User group integration', () => {
     });
     expect(await validate(invalidAddressBookDelete)).not.toHaveLength(0);
 
-    for (const methodName of [
-      'addSharedAddressBook',
-      'updateSharedAddressBook',
-      'deleteSharedAddressBooks',
-      'addRule',
-      'updateRule',
-      'deleteRules',
-    ] as const) {
-      const method = AddressBookController.prototype[methodName];
-      const methodGuards = Reflect.getMetadata(
-        GUARDS_METADATA,
-        method,
-      ) as unknown[];
-      expect(methodGuards).toContain(AdminGuard);
+    const expectedPermissions = {
+      addSharedAddressBook: ['address_books.share'],
+      updateSharedAddressBook: ['address_books.edit'],
+      deleteSharedAddressBooks: ['address_books.edit'],
+      addRule: ['address_books.share'],
+      updateRule: ['address_books.share'],
+      deleteRules: ['address_books.share'],
+    } as const;
+    for (const [methodName, permissions] of Object.entries(
+      expectedPermissions,
+    )) {
+      expect(
+        Reflect.getMetadata(
+          REQUIRE_PERMISSION_KEY,
+          AddressBookController.prototype[
+            methodName as keyof AddressBookController
+          ],
+        ),
+      ).toEqual(permissions);
+    }
+
+    const authenticatedSelfServiceMethods = [
+      'getCustomAddressBooks',
+      'addCustomAddressBook',
+      'updateCustomAddressBook',
+      'deleteCustomAddressBooks',
+      'getWebSharedAddressBooks',
+      'getWebSharedAddressBook',
+    ] as const;
+    for (const methodName of authenticatedSelfServiceMethods) {
+      const handler = AddressBookController.prototype[methodName];
+      expect(
+        Reflect.getMetadata(REQUIRE_PERMISSION_KEY, handler),
+      ).toBeUndefined();
+      expect(Reflect.getMetadata(GUARDS_METADATA, handler) ?? []).not.toContain(
+        AdminGuard,
+      );
     }
   });
 
@@ -820,14 +1191,8 @@ describe('User group integration', () => {
     await userGroupService.initializeStorage();
     const moduleRef = await Test.createTestingModule({
       controllers: [UserGroupController],
-      providers: [
-        { provide: UserGroupService, useValue: userGroupService },
-        AdminGuard,
-      ],
-    })
-      .overrideGuard(AdminGuard)
-      .useValue({ canActivate: () => true })
-      .compile();
+      providers: [{ provide: UserGroupService, useValue: userGroupService }],
+    }).compile();
     const app: INestApplication = moduleRef.createNestApplication();
     app.setGlobalPrefix('api');
     app.useGlobalPipes(

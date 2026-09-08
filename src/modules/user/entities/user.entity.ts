@@ -9,6 +9,7 @@ import {
   JoinColumn,
   Index,
 } from 'typeorm';
+import type { IndexOptions } from 'typeorm';
 import { UserToken } from './user-token.entity';
 import { Strategy } from '../../strategy/entities/strategy.entity';
 import { UserGroup } from '../../user-group/entities/user-group.entity';
@@ -39,6 +40,13 @@ export interface UserInfo {
  * 管理所有用户信息
  */
 @Entity('users')
+// DatabaseInitService creates this index after validating legacy owner rows.
+// Registering it with synchronize=false prevents schema sync from dropping it.
+@Index('UQ_users_single_owner', ['isAdmin'], {
+  unique: true,
+  where: '"isAdmin" = 1',
+  synchronize: false,
+} as IndexOptions & { synchronize: false })
 export class User {
   /**
    * 用户唯一标识符

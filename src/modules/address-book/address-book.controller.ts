@@ -10,7 +10,6 @@ import {
   Query,
   HttpCode,
   HttpStatus,
-  UseGuards,
 } from '@nestjs/common';
 import { AddressBookService } from './services';
 import {
@@ -31,7 +30,7 @@ import {
 } from './dto';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AddressBookRuleService } from './services/address-book-rule.service';
-import { AdminGuard } from '../../common/guards/admin.guard';
+import { RequirePermission } from '../rbac/decorators/require-permission.decorator';
 
 /**
  * 地址簿控制器
@@ -251,6 +250,28 @@ export class AddressBookController {
     );
   }
 
+  @Get('shared/:guid/access')
+  @HttpCode(HttpStatus.OK)
+  getWebSharedAddressBook(
+    @Param('guid') guid: string,
+    @CurrentUser('id') userId: number,
+  ) {
+    return this.addressBookService.getWebSharedAddressBook(
+      guid,
+      String(userId),
+    );
+  }
+
+  @Get('shared/:guid/share-candidates')
+  @RequirePermission('address_books.share')
+  @HttpCode(HttpStatus.OK)
+  getShareCandidates(
+    @Param('guid') guid: string,
+    @CurrentUser('id') userId: number,
+  ) {
+    return this.ruleService.getShareCandidates(guid, String(userId));
+  }
+
   /**
    * 添加共享地址簿
    * 创建一个新的共享地址簿
@@ -260,7 +281,7 @@ export class AddressBookController {
    * @returns 操作结果
    */
   @Post('shared/add')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.share')
   @HttpCode(HttpStatus.OK)
   async addSharedAddressBook(
     @Body() dto: CreateAddressBookProfileDto,
@@ -288,7 +309,7 @@ export class AddressBookController {
    * @returns 操作结果
    */
   @Put('shared/update/profile')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.edit')
   @HttpCode(HttpStatus.OK)
   async updateSharedAddressBook(
     @Body() dto: UpdateAddressBookProfileDto,
@@ -318,7 +339,7 @@ export class AddressBookController {
    * @returns 操作结果
    */
   @Delete('shared')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.edit')
   @HttpCode(HttpStatus.OK)
   async deleteSharedAddressBooks(
     @Body() guids: string[],
@@ -573,6 +594,7 @@ export class AddressBookController {
    * @returns 规则列表（分页）
    */
   @Get('rules')
+  @RequirePermission('address_books.view')
   @HttpCode(HttpStatus.OK)
   async getRules(
     @Query() query: RuleQueryDto,
@@ -590,7 +612,7 @@ export class AddressBookController {
    * @returns 新创建的规则 GUID
    */
   @Post('rule')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.share')
   @HttpCode(HttpStatus.OK)
   async addRule(@Body() dto: CreateRuleDto, @CurrentUser('id') userId: number) {
     return this.ruleService.createRule(dto, String(userId));
@@ -605,7 +627,7 @@ export class AddressBookController {
    * @returns 更新成功消息
    */
   @Patch('rule')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.share')
   @HttpCode(HttpStatus.OK)
   async updateRule(
     @Body() dto: UpdateRuleDto,
@@ -623,7 +645,7 @@ export class AddressBookController {
    * @returns 删除成功消息
    */
   @Delete('rules')
-  @UseGuards(AdminGuard)
+  @RequirePermission('address_books.share')
   @HttpCode(HttpStatus.OK)
   async deleteRules(
     @Body() ruleGuids: string[],

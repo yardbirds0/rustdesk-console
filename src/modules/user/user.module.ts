@@ -17,6 +17,10 @@ import { Strategy } from '../strategy/entities/strategy.entity';
 import { UserGroupModule } from '../user-group/user-group.module';
 import { EmailModule } from '../email/email.module';
 import { SettingsModule } from '../settings/settings.module';
+import { RbacModule } from '../rbac/rbac.module';
+import { Role } from '../rbac/entities/role.entity';
+import { UserRoleAssignment } from '../rbac/entities/user-role-assignment.entity';
+import { LoginSession } from '../auth/entities/login-session.entity';
 
 @Module({
   imports: [
@@ -30,11 +34,15 @@ import { SettingsModule } from '../settings/settings.module';
       DeviceGroupUserPermission,
       UserUserPermission,
       Strategy,
+      Role,
+      UserRoleAssignment,
+      LoginSession,
     ]),
     AuthModule,
     UserGroupModule,
     EmailModule,
     SettingsModule,
+    RbacModule,
   ],
   controllers: [UserController, AvatarController, AdminUserController],
   providers: [UserService, AdminUserService],

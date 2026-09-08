@@ -1,4 +1,11 @@
-import { IsNumber, Min, IsInt, IsString, IsOptional } from 'class-validator';
+import {
+  IsNumber,
+  Min,
+  IsInt,
+  IsString,
+  IsOptional,
+  IsIn,
+} from 'class-validator';
 import { Type } from 'class-transformer';
 
 /**
@@ -23,6 +30,16 @@ export class DeviceQueryDto {
   id?: string;
 
   @IsString()
+  @IsIn(['0', '1'])
+  @IsOptional()
+  status?: string;
+
+  @IsString()
+  @IsIn(['0', '1'])
+  @IsOptional()
+  is_online?: string;
+
+  @IsString()
   @IsOptional()
   device_name?: string;
 
@@ -36,5 +53,13 @@ export class DeviceQueryDto {
 
   @IsString()
   @IsOptional()
+  os?: string;
+
+  @IsString()
+  @IsOptional()
   device_group_name?: string;
+
+  @IsString()
+  @IsOptional()
+  device_group_guid?: string;
 }

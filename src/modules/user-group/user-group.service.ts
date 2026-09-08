@@ -16,6 +16,7 @@ import {
   UserGroupQueryDto,
 } from './dto/user-group.dto';
 import { UserGroup } from './entities/user-group.entity';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 
 const DEFAULT_USER_GROUP_NAME = 'Default';
 
@@ -33,6 +34,7 @@ export class UserGroupService {
     @InjectRepository(AddressBookRule)
     private readonly ruleRepository: Repository<AddressBookRule>,
     private readonly dataSource: DataSource,
+    private readonly authorizationService: RbacAuthorizationService,
   ) {}
 
   async initializeStorage(): Promise<UserGroup> {
@@ -223,7 +225,18 @@ export class UserGroupService {
     }
   }
 
-  async deleteGroup(guid: string) {
+  async deleteGroup(guid: string, actorGuid: string) {
+    const affectedUsers = await this.userRepository.find({
+      where: { userGroupGuid: guid },
+      select: ['guid'],
+    });
+    if (affectedUsers.length) {
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        affectedUsers.map((user) => user.guid),
+        'user_groups.delete',
+      );
+    }
     return this.dataSource.transaction(async (manager) => {
       const groupRepository = manager.getRepository(UserGroup);
       const userRepository = manager.getRepository(User);
@@ -243,6 +256,17 @@ export class UserGroupService {
       if (!defaultGroup) {
         throw new BadRequestException('默认用户组不存在');
       }
+
+      const currentUsers = await userRepository.find({
+        where: { userGroupGuid: guid },
+        select: ['guid'],
+      });
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        currentUsers.map((user) => user.guid),
+        'user_groups.delete',
+        manager,
+      );
 
       const movedUsers = await userRepository.update(
         { userGroupGuid: guid },
@@ -283,6 +307,10 @@ export class UserGroupService {
       .take(pageSize)
       .getManyAndCount();
 
+    const protection =
+      await this.authorizationService.getEffectiveProtectionMap(
+        users.map((user) => user.guid),
+      );
     return {
       data: users.map((user) => ({
         guid: user.guid,
@@ -291,6 +319,7 @@ export class UserGroupService {
         note: user.note || '',
         status: user.status,
         is_admin: user.isAdmin,
+        is_protected: protection.get(user.guid) === true,
         user_group_guid: group.guid,
         user_group_name: group.name,
       })),
@@ -298,7 +327,12 @@ export class UserGroupService {
     };
   }
 
-  async moveUsers(guid: string, userGuids: string[]) {
+  async moveUsers(guid: string, userGuids: string[], actorGuid: string) {
+    await this.authorizationService.assertUsersMutation(
+      actorGuid,
+      userGuids,
+      'user_groups.membership',
+    );
     const uniqueGuids = [...new Set(userGuids)];
 
     return this.dataSource.transaction(async (manager) => {
@@ -317,6 +351,15 @@ export class UserGroupService {
       if (users.length !== uniqueGuids.length) {
         throw new NotFoundException('一个或多个用户不存在');
       }
+
+      // Re-check immediately before the conditional writes so a role-based
+      // protection change cannot turn this into a partial membership update.
+      await this.authorizationService.assertUsersMutation(
+        actorGuid,
+        users.map((user) => user.guid),
+        'user_groups.membership',
+        manager,
+      );
 
       const guidsToMove = users
         .filter((user) => user.userGroupGuid !== guid)

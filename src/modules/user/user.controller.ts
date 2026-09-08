@@ -7,7 +7,6 @@ import {
   Body,
   Param,
   Query,
-  UseGuards,
   HttpCode,
   HttpStatus,
   UseInterceptors,
@@ -17,9 +16,10 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Throttle } from '@nestjs/throttler';
 import { UserService } from './user.service';
-import { AdminGuard } from '../../common/guards/admin.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Public } from '../auth/decorators/public.decorator';
+import { RequirePermission } from '../rbac/decorators/require-permission.decorator';
+import { RbacAuthorizationService } from '../rbac/services/rbac-authorization.service';
 import {
   CreateUserDto,
   InviteUserDto,
@@ -37,21 +37,38 @@ import {
 
 @Controller()
 export class UserController {
-  constructor(private readonly userService: UserService) {}
+  constructor(
+    private readonly userService: UserService,
+    private readonly rbacAuthorizationService: RbacAuthorizationService,
+  ) {}
 
   @Get('users')
   async getAccessibleUsers(
     @CurrentUser('id') userId: string,
-    @CurrentUser('isAdmin') isAdmin: boolean,
     @Query() query: UserQueryDto,
   ) {
-    return this.userService.getAccessibleUsers(userId, query, isAdmin);
+    const currentUser =
+      await this.rbacAuthorizationService.getCurrentUser(userId);
+    return this.userService.getAccessibleUsers(
+      userId,
+      query,
+      currentUser.isAdmin,
+    );
   }
 
   @Post('users')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.create')
   @HttpCode(HttpStatus.OK)
-  async createUser(@Body() dto: CreateUserDto) {
+  async createUser(
+    @Body() dto: CreateUserDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    if (dto.user_group_guid !== undefined) {
+      await this.rbacAuthorizationService.requirePermission(
+        actorGuid,
+        'user_groups.membership',
+      );
+    }
     return this.userService.createUser(dto);
   }
 
@@ -98,9 +115,18 @@ export class UserController {
   }
 
   @Post('users/invite')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.create')
   @HttpCode(HttpStatus.OK)
-  async inviteUser(@Body() dto: InviteUserDto) {
+  async inviteUser(
+    @Body() dto: InviteUserDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    if (dto.user_group_guid !== undefined) {
+      await this.rbacAuthorizationService.requirePermission(
+        actorGuid,
+        'user_groups.membership',
+      );
+    }
     return this.userService.inviteUser(dto);
   }
 
@@ -119,62 +145,156 @@ export class UserController {
   }
 
   @Patch('users/batch/status')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.status')
   @HttpCode(HttpStatus.OK)
-  async batchUpdateStatus(@Body() dto: BatchStatusDto) {
-    return this.userService.batchUpdateStatus(dto);
+  async batchUpdateStatus(
+    @Body() dto: BatchStatusDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.assertUsersMutation(
+      actorGuid,
+      dto.user_guids,
+      'users.status',
+    );
+    return this.userService.batchUpdateStatus(dto, actorGuid);
   }
 
   @Patch('users/batch/security')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.security')
   @HttpCode(HttpStatus.OK)
-  async batchUpdateSecurity(@Body() dto: BatchSecurityDto) {
-    return this.userService.batchUpdateSecurity(dto);
+  async batchUpdateSecurity(
+    @Body() dto: BatchSecurityDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.assertUsersMutation(
+      actorGuid,
+      dto.user_guids,
+      'users.security',
+    );
+    return this.userService.batchUpdateSecurity(dto, actorGuid);
   }
 
   @Delete('users/batch/sessions')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.force_logout')
   @HttpCode(HttpStatus.OK)
-  async batchDeleteSessions(@Body() dto: BatchSessionsDto) {
-    return this.userService.forceLogout(dto.user_guids);
+  async batchDeleteSessions(
+    @Body() dto: BatchSessionsDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.assertUsersMutation(
+      actorGuid,
+      dto.user_guids,
+      'users.force_logout',
+    );
+    return this.userService.forceLogout(dto.user_guids, actorGuid);
   }
 
   @Get('users/:guid')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.view')
   async getUser(@Param('guid') guid: string) {
-    return this.userService.getUser(guid);
+    const user = await this.userService.getUser(guid);
+    return {
+      ...user,
+      is_protected: await this.rbacAuthorizationService.isProtectedUser(
+        guid,
+        user.is_admin,
+      ),
+    };
   }
 
   @Patch('users/:guid')
-  @UseGuards(AdminGuard)
   @HttpCode(HttpStatus.OK)
-  async updateUser(@Param('guid') guid: string, @Body() dto: UpdateUserDto) {
-    return this.userService.updateUser(guid, dto);
+  async updateUser(
+    @Param('guid') guid: string,
+    @Body() dto: UpdateUserDto,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    // This endpoint accepts fields governed by different permissions, so each
+    // requested field is authorized before the single atomic update below.
+    let authorizedField = false;
+    if (
+      dto.name !== undefined ||
+      dto.display_name !== undefined ||
+      dto.email !== undefined ||
+      dto.note !== undefined
+    ) {
+      authorizedField = true;
+      await this.rbacAuthorizationService.assertUserMutation(
+        actorGuid,
+        guid,
+        'users.edit',
+      );
+    }
+    if (dto.status !== undefined) {
+      authorizedField = true;
+      await this.rbacAuthorizationService.assertUserMutation(
+        actorGuid,
+        guid,
+        'users.status',
+      );
+    }
+    if (dto.user_group_guid !== undefined) {
+      authorizedField = true;
+      await this.rbacAuthorizationService.assertUserMutation(
+        actorGuid,
+        guid,
+        'user_groups.membership',
+      );
+    }
+    if (dto.is_admin !== undefined) {
+      throw new BadRequestException('系统所有者身份不可通过用户编辑修改');
+    }
+    if (!authorizedField) {
+      throw new BadRequestException('没有可更新的字段');
+    }
+    return this.userService.updateUser(guid, dto, actorGuid);
   }
 
   @Delete('users/:guid')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.delete')
   @HttpCode(HttpStatus.OK)
-  async deleteUser(@Param('guid') guid: string) {
-    await this.userService.deleteUser(guid);
+  async deleteUser(
+    @Param('guid') guid: string,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.assertUserMutation(
+      actorGuid,
+      guid,
+      'users.delete',
+    );
+    await this.userService.deleteUser(guid, actorGuid);
     return { message: '用户已删除' };
   }
 
   @Patch('users/:guid/security')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.security')
   @HttpCode(HttpStatus.OK)
   async updateUserSecurity(
     @Param('guid') guid: string,
     @Body() dto: UpdateUserSecurityDto,
+    @CurrentUser('id') actorGuid: string,
   ) {
-    await this.userService.updateUserSecurity(guid, dto);
+    await this.rbacAuthorizationService.assertUserMutation(
+      actorGuid,
+      guid,
+      'users.security',
+    );
+    await this.userService.updateUserSecurity(guid, dto, actorGuid);
     return { message: '安全设置已更新' };
   }
 
   @Delete('users/:guid/sessions')
-  @UseGuards(AdminGuard)
+  @RequirePermission('users.force_logout')
   @HttpCode(HttpStatus.OK)
-  async deleteUserSessions(@Param('guid') guid: string) {
-    return this.userService.forceLogout([guid]);
+  async deleteUserSessions(
+    @Param('guid') guid: string,
+    @CurrentUser('id') actorGuid: string,
+  ) {
+    await this.rbacAuthorizationService.assertUserMutation(
+      actorGuid,
+      guid,
+      'users.force_logout',
+    );
+    return this.userService.forceLogout([guid], actorGuid);
   }
 }

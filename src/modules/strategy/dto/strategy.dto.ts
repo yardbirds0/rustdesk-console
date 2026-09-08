@@ -8,7 +8,9 @@ import {
   IsInt,
   IsArray,
   ArrayMaxSize,
+  ArrayMinSize,
   IsIn,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
@@ -42,24 +44,27 @@ export class UpdateStrategyDto {
 
 export class AssignStrategyDto {
   @IsString()
-  @IsNotEmpty()
+  @IsIn(['device', 'user', 'device_group'])
   target_type: 'device' | 'user' | 'device_group';
 
   @IsArray()
-  @IsNotEmpty()
+  @ArrayMinSize(1)
   @ArrayMaxSize(200)
+  @IsString({ each: true })
   target_guids: string[];
 }
 
 export class StrategyQueryDto {
   @IsNumber()
   @Min(1)
+  @Max(100000)
   @IsInt()
   @Type(() => Number)
   current: number;
 
   @IsNumber()
   @Min(1)
+  @Max(200)
   @IsInt()
   @Type(() => Number)
   pageSize: number;
@@ -67,6 +72,33 @@ export class StrategyQueryDto {
   @IsString()
   @IsOptional()
   name?: string;
+}
+
+export class StrategyCandidateDto {
+  guid: string;
+  name: string;
+  note: string;
+}
+
+export class StrategyTargetCandidateQueryDto {
+  @IsString()
+  @IsNotEmpty()
+  @IsIn(['device', 'user'])
+  target_type: 'device' | 'user';
+
+  @IsNumber()
+  @Min(1)
+  @Max(100000)
+  @IsInt()
+  @Type(() => Number)
+  current: number;
+
+  @IsNumber()
+  @Min(1)
+  @Max(200)
+  @IsInt()
+  @Type(() => Number)
+  pageSize: number;
 }
 
 export class AssignmentQueryDto {
@@ -77,12 +109,14 @@ export class AssignmentQueryDto {
 
   @IsNumber()
   @Min(1)
+  @Max(100000)
   @IsInt()
   @Type(() => Number)
   current: number;
 
   @IsNumber()
   @Min(1)
+  @Max(200)
   @IsInt()
   @Type(() => Number)
   pageSize: number;

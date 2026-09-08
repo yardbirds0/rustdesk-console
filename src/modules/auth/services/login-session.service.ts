@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, MoreThan } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
@@ -116,8 +116,14 @@ export class LoginSessionService {
    * 标记会话为已使用，防止重放攻击
    */
   async markSessionUsed(session: LoginSession): Promise<void> {
+    const result = await this.loginSessionRepository.update(
+      { guid: session.guid, used: false },
+      { used: true },
+    );
+    if (result.affected !== 1) {
+      throw new UnauthorizedException('登录会话已使用或已撤销');
+    }
     session.used = true;
-    await this.loginSessionRepository.save(session);
   }
 
   /**
@@ -129,5 +135,9 @@ export class LoginSessionService {
       userGuid,
       used: false,
     });
+  }
+
+  async revokeUserSessions(userGuid: string): Promise<void> {
+    await this.deleteUserUnusedSessions(userGuid);
   }
 }
