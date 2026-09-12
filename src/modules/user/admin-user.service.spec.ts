@@ -102,11 +102,7 @@ describe('AdminUserService role names', () => {
     expect(authorizationService.getCurrentUser).toHaveBeenCalledWith('actor');
     expect(assignmentRepository.find).toHaveBeenCalledTimes(1);
     expect(roleRepository.find).toHaveBeenCalledTimes(1);
-    expect(result.data[0].role_names).toEqual([
-      'Super Admin',
-      'Alpha',
-      'Zulu',
-    ]);
+    expect(result.data[0].role_names).toEqual(['Super Admin', 'Alpha', 'Zulu']);
     expect(result.data[1].role_names).toEqual([]);
   });
 
