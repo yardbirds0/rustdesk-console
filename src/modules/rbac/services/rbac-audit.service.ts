@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, Repository } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
@@ -67,8 +67,8 @@ export class RbacAuditService {
     current?: number;
     created_at?: string;
   }): Promise<{ data: Record<string, unknown>[]; total: number }> {
-    const pageSize = filters.pageSize || 20;
-    const current = filters.current || 1;
+    const pageSize = this.boundPageSize(filters.pageSize);
+    const current = this.boundCurrent(filters.current);
     const query = this.repository
       .createQueryBuilder('audit')
       .leftJoin(User, 'actor', 'actor.guid = audit.actorUserGuid')
@@ -79,9 +79,11 @@ export class RbacAuditService {
       });
     }
     if (filters.created_at) {
-      query.andWhere('audit.createdAt >= :createdAt', {
-        createdAt: new Date(filters.created_at),
-      });
+      const createdAt = new Date(filters.created_at);
+      if (Number.isNaN(createdAt.getTime())) {
+        throw new BadRequestException('created_at 不是有效的日期字符串');
+      }
+      query.andWhere('audit.createdAt >= :createdAt', { createdAt });
     }
     const total = await query.getCount();
     const { entities: rows, raw } = await query
@@ -132,6 +134,7 @@ export class RbacAuditService {
   private redact(value: unknown): unknown {
     if (Array.isArray(value)) return value.map((item) => this.redact(item));
     if (!value || typeof value !== 'object') return value;
+    if (value instanceof Date) return value.toJSON();
     const result: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
       if (
@@ -143,5 +146,20 @@ export class RbacAuditService {
       }
     }
     return result;
+  }
+
+  private boundPageSize(value: number | undefined): number {
+    const DEFAULT_PAGE_SIZE = 20;
+    const MAX_PAGE_SIZE = 100;
+    if (value === undefined || value === null) return DEFAULT_PAGE_SIZE;
+    if (!Number.isFinite(value) || value <= 0) return DEFAULT_PAGE_SIZE;
+    return Math.min(Math.floor(value), MAX_PAGE_SIZE);
+  }
+
+  private boundCurrent(value: number | undefined): number {
+    const DEFAULT_CURRENT = 1;
+    if (value === undefined || value === null) return DEFAULT_CURRENT;
+    if (!Number.isFinite(value) || value <= 0) return DEFAULT_CURRENT;
+    return Math.floor(value);
   }
 }

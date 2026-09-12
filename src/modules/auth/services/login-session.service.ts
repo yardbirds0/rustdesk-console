@@ -117,7 +117,7 @@ export class LoginSessionService {
    */
   async markSessionUsed(session: LoginSession): Promise<void> {
     const result = await this.loginSessionRepository.update(
-      { guid: session.guid, used: false },
+      { guid: session.guid, used: false, expiresAt: MoreThan(new Date()) },
       { used: true },
     );
     if (result.affected !== 1) {

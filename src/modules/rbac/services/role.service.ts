@@ -90,11 +90,11 @@ export class RoleService {
   }
 
   async createRole(dto: CreateRoleDto, actorGuid: string) {
-    await this.authorizationService.requireSuperAdmin(actorGuid);
     const name = this.normalizeName(dto.name);
     const permissions = this.validatePermissions(dto.permissions);
     await this.ensureNameAvailable(name);
     return this.dataSource.transaction(async (manager) => {
+      await this.authorizationService.requireSuperAdmin(actorGuid, manager);
       const role = manager.getRepository(Role).create({
         guid: uuidv4(),
         name,
@@ -240,8 +240,8 @@ export class RoleService {
   }
 
   async deleteRole(guid: string, actorGuid: string): Promise<void> {
-    await this.authorizationService.requireSuperAdmin(actorGuid);
     await this.dataSource.transaction(async (manager) => {
+      await this.authorizationService.requireSuperAdmin(actorGuid, manager);
       const roleRepository = manager.getRepository(Role);
       const permissionRepository = manager.getRepository(RolePermission);
       const assignmentRepository = manager.getRepository(UserRoleAssignment);

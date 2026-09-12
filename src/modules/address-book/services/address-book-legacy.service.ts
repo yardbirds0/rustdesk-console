@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { Repository, In, DataSource } from 'typeorm';
 import { v4 as uuidv4 } from 'uuid';
 import {
   AddressBook,
@@ -36,6 +36,7 @@ export class AddressBookLegacyService {
     private sysinfoRepository: Repository<Sysinfo>,
     @InjectRepository(Peer)
     private peerRepository: Repository<Peer>,
+    private readonly dataSource: DataSource,
   ) {}
 
   /**
@@ -215,72 +216,81 @@ export class AddressBookLegacyService {
 
     // Remove only this address book's peer-tag links. The legacy endpoint is
     // user-scoped; an empty delete criteria would erase every user's tags.
-    const existingPeers = await this.addressBookPeerRepository.find({
-      where: { addressBookGuid },
-      select: ['guid'],
-    });
-    if (existingPeers.length > 0) {
-      await this.addressBookPeerTagRepository.delete({
-        peerGuid: In(existingPeers.map((peer) => peer.guid)),
+    // Run the full replacement inside one transaction so a later write failure
+    // rolls back the deletes instead of leaving the address book partially
+    // deleted.
+    await this.dataSource.transaction(async (manager) => {
+      const peerRepository = manager.getRepository(AddressBookPeer);
+      const peerTagRepository = manager.getRepository(AddressBookPeerTag);
+      const tagRepository = manager.getRepository(AddressBookTag);
+
+      const existingPeers = await peerRepository.find({
+        where: { addressBookGuid },
+        select: ['guid'],
       });
-    }
-    await this.addressBookTagRepository.delete({ addressBookGuid });
-    await this.addressBookPeerRepository.delete({ addressBookGuid });
-
-    // 创建新标签
-    const tagNameToGuid: Record<string, string> = {};
-    const dangerousProperties = ['__proto__', 'constructor', 'prototype'];
-
-    if (parsedData.tags && parsedData.tags.length > 0) {
-      for (const tagName of parsedData.tags) {
-        if (dangerousProperties.includes(tagName)) {
-          continue;
-        }
-
-        const tagGuid = uuidv4();
-        const tag = this.addressBookTagRepository.create({
-          guid: tagGuid,
-          addressBookGuid,
-          name: tagName,
-          color: tagColors[tagName] || 0,
+      if (existingPeers.length > 0) {
+        await peerTagRepository.delete({
+          peerGuid: In(existingPeers.map((peer) => peer.guid)),
         });
-        await this.addressBookTagRepository.save(tag);
-        tagNameToGuid[tagName] = tagGuid;
       }
-    }
+      await tagRepository.delete({ addressBookGuid });
+      await peerRepository.delete({ addressBookGuid });
 
-    // 创建新设备
-    if (parsedData.peers && parsedData.peers.length > 0) {
-      for (const peerData of parsedData.peers) {
-        // 通过 findOrCreatePeer 查找或创建 peer 记录，获取 uuid 作为 deviceId
-        // 与新版 API 保持一致：deviceId 始终引用 peers.uuid
-        const peerRecord = await this.findOrCreatePeer(peerData.id);
+      // 创建新标签
+      const tagNameToGuid: Record<string, string> = {};
+      const dangerousProperties = ['__proto__', 'constructor', 'prototype'];
 
-        const peerGuid = uuidv4();
-        const peer = this.addressBookPeerRepository.create({
-          guid: peerGuid,
-          addressBookGuid,
-          deviceId: peerRecord.uuid,
-          hash: peerData.hash || '',
-          alias: peerData.alias || '',
-        });
-        await this.addressBookPeerRepository.save(peer);
+      if (parsedData.tags && parsedData.tags.length > 0) {
+        for (const tagName of parsedData.tags) {
+          if (dangerousProperties.includes(tagName)) {
+            continue;
+          }
 
-        // 处理标签关联
-        if (peerData.tags && peerData.tags.length > 0) {
-          for (const tagName of peerData.tags) {
-            const tagGuid = tagNameToGuid[tagName];
-            if (tagGuid) {
-              const peerTag = this.addressBookPeerTagRepository.create({
-                peerGuid,
-                tagGuid,
-              });
-              await this.addressBookPeerTagRepository.save(peerTag);
+          const tagGuid = uuidv4();
+          const tag = tagRepository.create({
+            guid: tagGuid,
+            addressBookGuid,
+            name: tagName,
+            color: tagColors[tagName] || 0,
+          });
+          await tagRepository.save(tag);
+          tagNameToGuid[tagName] = tagGuid;
+        }
+      }
+
+      // 创建新设备
+      if (parsedData.peers && parsedData.peers.length > 0) {
+        for (const peerData of parsedData.peers) {
+          // 通过 findOrCreatePeer 查找或创建 peer 记录，获取 uuid 作为 deviceId
+          // 与新版 API 保持一致：deviceId 始终引用 peers.uuid
+          const peerRecord = await this.findOrCreatePeer(peerData.id);
+
+          const peerGuid = uuidv4();
+          const peer = peerRepository.create({
+            guid: peerGuid,
+            addressBookGuid,
+            deviceId: peerRecord.uuid,
+            hash: peerData.hash || '',
+            alias: peerData.alias || '',
+          });
+          await peerRepository.save(peer);
+
+          // 处理标签关联
+          if (peerData.tags && peerData.tags.length > 0) {
+            for (const tagName of peerData.tags) {
+              const tagGuid = tagNameToGuid[tagName];
+              if (tagGuid) {
+                const peerTag = peerTagRepository.create({
+                  peerGuid,
+                  tagGuid,
+                });
+                await peerTagRepository.save(peerTag);
+              }
             }
           }
         }
       }
-    }
+    });
 
     return 'null';
   }

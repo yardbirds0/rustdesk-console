@@ -82,7 +82,7 @@ describe('AdminUserService role names', () => {
     authorizationService.getCurrentUser.mockResolvedValue({ isAdmin: true });
     queryBuilder.getManyAndCount.mockResolvedValue([
       [
-        { guid: 'user-1', username: 'alice' },
+        { guid: 'user-1', username: 'alice', isAdmin: true },
         { guid: 'user-2', username: 'bob' },
       ] as User[],
       2,
@@ -102,7 +102,11 @@ describe('AdminUserService role names', () => {
     expect(authorizationService.getCurrentUser).toHaveBeenCalledWith('actor');
     expect(assignmentRepository.find).toHaveBeenCalledTimes(1);
     expect(roleRepository.find).toHaveBeenCalledTimes(1);
-    expect(result.data[0].role_names).toEqual(['Alpha', 'Zulu']);
+    expect(result.data[0].role_names).toEqual([
+      'Super Admin',
+      'Alpha',
+      'Zulu',
+    ]);
     expect(result.data[1].role_names).toEqual([]);
   });
 
