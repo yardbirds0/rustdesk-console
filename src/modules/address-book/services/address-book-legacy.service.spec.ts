@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { AddressBookLegacyService } from './address-book-legacy.service';
 import {
   AddressBook,
@@ -43,6 +43,21 @@ describe('AddressBookLegacyService', () => {
     });
     addressBookPeerRepository.find.mockResolvedValue([{ guid: 'entry-a' }]);
 
+    const dataSource = {
+      transaction: async (cb: (manager: unknown) => Promise<unknown>) => {
+        const manager = {
+          getRepository: (target: unknown) => {
+            if (target === AddressBookPeer) return addressBookPeerRepository;
+            if (target === AddressBookPeerTag)
+              return addressBookPeerTagRepository;
+            if (target === AddressBookTag) return addressBookTagRepository;
+            throw new Error(`unexpected repository: ${String(target)}`);
+          },
+        };
+        return cb(manager);
+      },
+    };
+
     const service = new AddressBookLegacyService(
       addressBookRepository as unknown as Repository<AddressBook>,
       addressBookPeerRepository as unknown as Repository<AddressBookPeer>,
@@ -50,6 +65,7 @@ describe('AddressBookLegacyService', () => {
       addressBookPeerTagRepository as unknown as Repository<AddressBookPeerTag>,
       sysinfoRepository as unknown as Repository<Sysinfo>,
       peerRepository as unknown as Repository<Peer>,
+      dataSource as unknown as DataSource,
     );
 
     await service.updateLegacyAddressBook(
