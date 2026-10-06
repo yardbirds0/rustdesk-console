@@ -1,3 +1,4 @@
+import { businessWritesAllowed } from '../../updater/maintenance';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between } from 'typeorm';
@@ -166,6 +167,7 @@ export class UpdateCheckService implements OnModuleInit {
   private fetchUpdate(
     frontendVersion = this.lastKnownFrontendVersion,
   ): Promise<void> {
+    if (!businessWritesAllowed()) return Promise.resolve();
     if (this.pendingUpdate) return this.pendingUpdate.promise;
     const promise = this.performUpdateCheck(frontendVersion).finally(() => {
       this.pendingUpdate = undefined;

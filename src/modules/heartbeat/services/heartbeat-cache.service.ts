@@ -3,6 +3,7 @@ import { Interval } from '@nestjs/schedule';
 import { DataSource, EntityManager, In } from 'typeorm';
 import { Peer } from '../../../common/entities';
 import { ActiveConnection } from '../entities/active-connection.entity';
+import { businessWritesAllowed } from '../../../updater/maintenance';
 
 const HEARTBEAT_FLUSH_INTERVAL_MS = 15000;
 
@@ -55,6 +56,7 @@ export class HeartbeatCacheService implements OnModuleDestroy {
 
   @Interval(HEARTBEAT_FLUSH_INTERVAL_MS)
   async handleScheduledFlush(): Promise<void> {
+    if (!businessWritesAllowed()) return;
     await this.flush();
   }
 

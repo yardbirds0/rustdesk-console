@@ -22,6 +22,7 @@ import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard';
 import { SettingsModule } from './modules/settings/settings.module';
 import { LdapModule } from './modules/ldap/ldap.module';
 import { StrategyModule } from './modules/strategy/strategy.module';
+import { SystemUpdateModule } from './modules/system-update/system-update.module';
 import { UpdateCheckModule } from './modules/update-check/update-check.module';
 import { NexusModule } from './modules/nexus/nexus.module';
 import { UserGroupModule } from './modules/user-group/user-group.module';
@@ -95,6 +96,7 @@ import { ConsoleAuditInterceptor } from './modules/rbac/interceptors/console-aud
     LdapModule,
     StrategyModule,
     UpdateCheckModule,
+    SystemUpdateModule,
     NexusModule,
     UserGroupModule,
     RbacModule,

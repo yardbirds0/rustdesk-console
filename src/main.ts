@@ -1,58 +1,45 @@
 import 'dotenv/config';
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module';
-import { ValidationPipe, Logger } from '@nestjs/common';
-import cookieParser from 'cookie-parser';
-import { runMigrationCommand } from './database/migration-command';
+import { safeError } from './updater/errors';
+import { waitForApplicationStart } from './updater/maintenance';
 
-async function bootstrap() {
-  const logger = new Logger('Bootstrap');
-  const app = await NestFactory.create(AppModule);
+const mode = process.argv
+  .find((value) => value.startsWith('--system-update-mode='))
+  ?.split('=')[1];
 
-  // Enable graceful shutdown so SIGTERM triggers onModuleDestroy flushes
-  app.enableShutdownHooks();
-
-  // Configure cookie parsing middleware
-  app.use(cookieParser());
-
-  // Set global route prefix
-  app.setGlobalPrefix('api');
-
-  // Enable CORS
-  app.enableCors({
-    origin: true,
-    credentials: true,
-  });
-
-  // Global validation pipe
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      transform: true,
-      forbidNonWhitelisted: true,
-    }),
-  );
-
-  const port = process.env.PORT ?? 3000;
-  await app.listen(port);
-  logger.log(`Application is running on: http://localhost:${port}/api`);
+async function main(): Promise<void> {
+  if (mode) {
+    // Dispatch before loading TypeORM; updater processes never open the business database.
+    const { updaterMain } = await import('./updater/entrypoint.js');
+    await updaterMain(mode);
+    return;
+  }
+  await waitForApplicationStart();
+  const command = process.argv[2];
+  if (
+    command === 'migrate' ||
+    command === 'baseline' ||
+    command === 'show-migrations'
+  ) {
+    const { runMigrationCommand } =
+      await import('./database/migration-command.js');
+    await runMigrationCommand(
+      command === 'migrate'
+        ? 'run'
+        : command === 'baseline'
+          ? 'baseline'
+          : 'show',
+    );
+    return;
+  }
+  const { bootstrap } = await import('./application.js');
+  await bootstrap();
 }
-const command = process.argv[2];
-if (
-  command === 'migrate' ||
-  command === 'baseline' ||
-  command === 'show-migrations'
-) {
-  void runMigrationCommand(
-    command === 'migrate'
-      ? 'run'
-      : command === 'baseline'
-        ? 'baseline'
-        : 'show',
-  ).catch((error: unknown) => {
+void main().catch((error: unknown) => {
+  if (mode) {
+    const failure = safeError(error);
+    process.stderr.write(failure.code + ': ' + failure.message + '\n');
+  } else {
     console.error(error);
-    process.exitCode = 1;
-  });
-} else {
-  void bootstrap();
-}
+  }
+  process.exitCode = 1;
+});
