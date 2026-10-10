@@ -30,7 +30,9 @@ export const officialFetch: FetchBytes = async (
     );
     const response = await fetch(url, {
       redirect: 'manual',
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(
+        Math.max(120_000, Math.ceil(limit / (256 * 1024)) * 1000),
+      ),
       headers: {
         Accept: 'application/vnd.github+json',
         'User-Agent': 'rustdesk-console-updater/1',

@@ -80,7 +80,9 @@ async function main(): Promise<void> {
     assert.deepEqual(blockers, []);
     console.log('mysql: preflight passed');
     const grants = await query('SHOW GRANTS FOR CURRENT_USER;');
-    assert(!/GRANT (?:ALL PRIVILEGES|[^\n]*CREATE[^\n]*) ON \*\.\*/.test(grants));
+    assert(
+      !/GRANT (?:ALL PRIVILEGES|[^\n]*CREATE[^\n]*) ON \*\.\*/.test(grants),
+    );
     const readonly = await adapter.preflight({
       ...context,
       database: {
@@ -89,7 +91,9 @@ async function main(): Promise<void> {
       },
     });
     assert.equal(readonly[0]?.code, 'MYSQL_RESTORE_PRIVILEGES_REQUIRED');
-    await assert.rejects(adapter.backup({ ...context, servicesStopped: false }));
+    await assert.rejects(
+      adapter.backup({ ...context, servicesStopped: false }),
+    );
     const snapshot = await adapter.backup(context);
     console.log('mysql: snapshot created');
     await adapter.validate(context, snapshot);

@@ -238,7 +238,7 @@ export class ComposeDeployment implements DeploymentAdapter {
           },
         },
       },
-      0o600,
+      0o644,
     );
     const config = await this.config();
     assert(

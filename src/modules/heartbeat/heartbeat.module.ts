@@ -11,11 +11,7 @@ import { StrategyModule } from '../strategy/strategy.module';
 @Module({
   imports: [TypeOrmModule.forFeature([Peer, ActiveConnection]), StrategyModule],
   controllers: [HeartbeatController],
-  providers: [
-    HeartbeatService,
-    DisconnectStoreService,
-    HeartbeatCacheService,
-  ],
+  providers: [HeartbeatService, DisconnectStoreService, HeartbeatCacheService],
   exports: [HeartbeatService, DisconnectStoreService],
 })
 export class HeartbeatModule {}

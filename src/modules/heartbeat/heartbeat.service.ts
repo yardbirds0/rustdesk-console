@@ -121,5 +121,4 @@ export class HeartbeatService {
       return null;
     }
   }
-
 }
