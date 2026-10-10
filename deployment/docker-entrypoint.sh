@@ -26,7 +26,8 @@ esac
 
 if [ "$(id -u)" = 0 ]; then
   mkdir -p "${DATA_DIR:-/data}"
-  chown 1000:1000 "${DATA_DIR:-/data}"
+  find "${DATA_DIR:-/data}" -xdev \( \! -user 1000 -o \! -group 1000 \) \
+    -exec chown -h 1000:1000 {} +
   exec su-exec 1000:1000 "$@"
 fi
 exec "$@"

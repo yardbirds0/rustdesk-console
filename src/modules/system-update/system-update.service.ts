@@ -31,9 +31,21 @@ export function ipcRequest<T>(
         timeout: 180_000,
       },
       (response) => {
+        response.setEncoding('utf8');
+        response.on('error', (error: unknown) =>
+          reject(
+            error instanceof UpdateError
+              ? error
+              : new UpdateError(
+                  'HELPER_UNAVAILABLE',
+                  'The installed updater is temporarily unavailable. Check the host service.',
+                  503,
+                ),
+          ),
+        );
         let text = '';
-        response.on('data', (chunk: Buffer) => {
-          text += chunk.toString('utf8');
+        response.on('data', (chunk: string) => {
+          text += chunk;
           if (text.length > 2 * 1024 * 1024)
             req.destroy(
               new UpdateError(

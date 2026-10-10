@@ -58,8 +58,9 @@ test(
     assert.equal(migration.child.exitCode, null);
     await assert.rejects(fs.stat(data), { code: 'ENOENT' });
 
+    const staged = `${fence}.tmp`;
     await fs.writeFile(
-      fence,
+      staged,
       JSON.stringify({
         schemaVersion: 1,
         jobId: 'test',
@@ -67,6 +68,7 @@ test(
         allowStart: true,
       }),
     );
+    await fs.rename(staged, fence);
     const migrated = await migration.result;
     assert.equal(migrated.code, 0, migrated.output);
     assert.ok((await fs.stat(join(data, 'rustdesk-console.db'))).size > 0);

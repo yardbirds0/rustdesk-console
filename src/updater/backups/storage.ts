@@ -412,18 +412,18 @@ export async function restoreFiles(
       force: false,
       preserveTimestamps: true,
     });
-    const retained = await scanFiles(retainedRoot);
-    for (const item of retained.filter((item) => item.kind === 'file')) {
-      const handle = await fs.open(join(retainedRoot, item.path), 'r+');
+    const copied = await scanFiles(destination, new Set(), false);
+    for (const item of copied.filter((item) => item.kind === 'file')) {
+      const handle = await fs.open(join(destination, item.path), 'r+');
       try {
         await handle.sync();
       } finally {
         await handle.close();
       }
     }
-    for (const item of [...retained].reverse()) {
+    for (const item of [...copied].reverse()) {
       if (item.kind === 'directory')
-        await syncDirectory(join(retainedRoot, item.path));
+        await syncDirectory(join(destination, item.path));
     }
     await syncDirectory(retainedRoot);
     await syncDirectory(quarantine);

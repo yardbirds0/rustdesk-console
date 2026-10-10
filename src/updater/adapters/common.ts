@@ -136,6 +136,11 @@ export async function verifyHelper(
               data += chunk.toString();
               if (data.length > 8192) req.destroy();
             });
+            response.once('error', reject);
+            response.once('close', () => {
+              if (!response.complete)
+                reject(new Error('The helper response is incomplete.'));
+            });
             response.on('end', () => {
               try {
                 const value = JSON.parse(data) as {

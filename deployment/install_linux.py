@@ -340,7 +340,11 @@ def main():
     arch = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(platform.machine())
     if not arch:
         raise ValueError('Supported Linux architectures are x64 and arm64')
-    libc = 'musl' if list(pathlib.Path('/lib').glob('ld-musl-*.so.1')) else 'glibc'
+    try:
+        glibc = os.confstr('CS_GNU_LIBC_VERSION')
+    except (ValueError, OSError):
+        glibc = None
+    libc = 'glibc' if glibc else 'musl'
     target = {'os': 'linux', 'arch': arch, 'libc': libc}
     values = database_environment(parse_environment(options.config))
     values.setdefault('JWT_SECRET', secrets.token_urlsafe(48))

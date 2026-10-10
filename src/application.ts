@@ -13,9 +13,15 @@ export async function bootstrap() {
   app.enableShutdownHooks();
   // Direct backend clients must also respect the persistent maintenance fence.
   app.use((request: Request, response: Response, next: NextFunction) => {
+    const isSystemUpdateStatusRequest =
+      request.method === 'GET' &&
+      (request.path === '/api/system-update/jobs/current' ||
+        /^\/api\/system-update\/jobs\/[^/]+$/.test(request.path));
+
     if (
       !businessWritesAllowed() &&
-      request.path !== '/api/system-update/health'
+      request.path !== '/api/system-update/health' &&
+      !isSystemUpdateStatusRequest
     ) {
       response.status(503).setHeader('Retry-After', '5');
       response.json({
